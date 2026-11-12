@@ -19,6 +19,22 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     public string DatabaseName { get; } = "t" + Guid.NewGuid().ToString("N");
 
+    /// <summary>The origin <see cref="PublicApi"/> is reached at.</summary>
+    public const string PublicUrl = "https://komogentic.test";
+
+    private WebApplicationFactory<Program>? _publicApi;
+
+    /// <summary>
+    /// The app as a public instance: <c>Komogentic:PublicUrl</c> set and the client address taken from
+    /// <c>X-Forwarded-For</c>, so each test can count against an address of its own. Built once and shared, so its
+    /// in-memory rate limits are shared too.
+    /// </summary>
+    public WebApplicationFactory<Program> PublicApi => _publicApi ??= WithWebHostBuilder(b =>
+    {
+        b.UseSetting("Komogentic:PublicUrl", PublicUrl);
+        b.UseSetting("Komogentic:Proxy:Trusted", "true");
+    });
+
     /// <summary>The app's database, for tests that look behind the server's back.</summary>
     public IMongoDatabase Database => new MongoClient(MongoConnectionString).GetDatabase(DatabaseName);
 
