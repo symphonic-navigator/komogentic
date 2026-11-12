@@ -60,7 +60,7 @@ public sealed class Connections(IMongoDatabase db, TimeProvider time)
     private DateTime Now => time.GetUtcNow().UtcDateTime;
 
     /// <summary>
-    /// Creates a connection that waits for an app to authorise it. <see cref="ArgumentException"/> for a name that is
+    /// Creates a connection that waits for an app to authorise it. <see cref="UserInputException"/> for a name that is
     /// empty, longer than <see cref="MaxNameLength"/> or holds control or invisible formatting characters, or an expiry
     /// other than <see cref="CredentialRules.ExpiryDays"/> or never; <see cref="ConnectionNameTakenException"/> if another of the
     /// user's connections that is neither revoked nor expired has that name (case aside).

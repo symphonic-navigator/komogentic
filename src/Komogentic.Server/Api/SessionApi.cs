@@ -6,7 +6,10 @@ using Microsoft.AspNetCore.Http.HttpResults;
 
 namespace Komogentic.Server.Api;
 
-public sealed record SignInRequest(string Username, string Password);
+public sealed record SignInRequest(string Username, string Password)
+{
+    public override string ToString() => $"SignInRequest {{ Username = {Username} }}";
+}
 
 public sealed record SessionView(string Username, DateTime ExpiresAt);
 

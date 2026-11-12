@@ -22,8 +22,9 @@ public sealed record CreatedKey(string Key, string Secret)
     public override string ToString() => $"CreatedKey {{ Key = {Key} }}";
 }
 
-/// <summary>A stack's id (<c>_id.$oid</c>) and canonical name, from <c>entities/stack.rs</c> <c>Stack</c> (a <c>Resource</c>, <c>entities/mod.rs</c>).</summary>
-public sealed record StackRef(string Id, string Name);
+/// <summary>A stack's id (<c>_id.$oid</c>), canonical name and Swarm (<c>config.swarm_id</c>, empty in Server mode), from
+/// <c>entities/stack.rs</c> <c>Stack</c> (a <c>Resource</c>, <c>entities/mod.rs</c>).</summary>
+public sealed record StackRef(string Id, string Name, string SwarmId = "");
 
 /// <summary><c>entities/stack.rs</c> <c>StackListItem</c> = <c>ResourceListItem&lt;StackListItemInfo&gt;</c> (<c>entities/resource.rs</c>).</summary>
 public sealed record StackListItem(string Id, string Name, StackListItemInfo Info);

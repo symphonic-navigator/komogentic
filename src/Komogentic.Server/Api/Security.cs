@@ -49,7 +49,8 @@ public static class Security
     }
 
     /// <summary>
-    /// After <see cref="Auth.CallerMiddleware"/>, for <c>/api</c>: a state-changing request (not GET, HEAD, OPTIONS),
+    /// Before <see cref="Auth.CallerMiddleware"/>, so that a refused request never resolves (nor keeps alive) a session;
+    /// for <c>/api</c>: a state-changing request (not GET, HEAD, OPTIONS),
     /// signed in or anonymous (sign-in itself), needs an <c>Origin</c> equal to <c>Komogentic:PublicUrl</c>'s, else 403;
     /// a missing <c>Origin</c> is refused too (browsers send it on every such request). This is the CSRF check behind
     /// <c>SameSite=Strict</c>, which a page on a sibling subdomain (the same site) gets past. Without a

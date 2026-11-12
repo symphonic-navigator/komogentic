@@ -67,6 +67,10 @@ public sealed class KomogenticOptionsValidator(IHostEnvironment environment) : I
             failures.Add("Komogentic:PublicUrl must be scheme, host and port only, without a path (KOMOGENTIC_PUBLIC_URL).");
         if (options.OAuth.AllowLoopbackClients && environment.IsProduction())
             failures.Add("Komogentic:OAuth:AllowLoopbackClients is for tests and development only: it lets client metadata documents come from this machine's own addresses, so it is refused in Production.");
+        // In Production the address must not come from the Host header, which a client picks: not for the issuer, the
+        // connection URLs or the Origin check.
+        if (string.IsNullOrEmpty(options.PublicUrl) && environment.IsProduction())
+            failures.Add("Komogentic:PublicUrl (KOMOGENTIC_PUBLIC_URL) must be set in Production: the address people and apps reach Komogentic at.");
         // Without a public URL the issuer and the connection URLs would come from the Host header, which a client picks.
         if (options.Proxy.Trusted && string.IsNullOrEmpty(options.PublicUrl))
             failures.Add("Komogentic:Proxy:Trusted (KOMOGENTIC_TRUSTED_PROXY) needs Komogentic:PublicUrl (KOMOGENTIC_PUBLIC_URL).");

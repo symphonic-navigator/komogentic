@@ -46,6 +46,18 @@ public sealed class OptionsTests(AppFactory app)
     }
 
     [Fact]
+    public void Production_needs_a_public_url()
+    {
+        using var broken = app.WithWebHostBuilder(b => b.UseEnvironment("Production").UseSetting("Komogentic:PublicUrl", ""));
+        using var fine = app.WithWebHostBuilder(b => b.UseEnvironment("Production").UseSetting("Komogentic:PublicUrl", "https://komogentic.example.org"));
+
+        var e = Assert.ThrowsAny<Exception>(() => broken.CreateClient());
+        Assert.Contains("Komogentic:PublicUrl", Unwrap(e).Message);
+        Assert.Contains("Production", Unwrap(e).Message);
+        using var client = fine.CreateClient();
+    }
+
+    [Fact]
     public void Trusted_proxy_needs_a_public_url()
     {
         using var broken = app.WithWebHostBuilder(b => b.UseSetting("Komogentic:Proxy:Trusted", "true").UseSetting("Komogentic:PublicUrl", ""));

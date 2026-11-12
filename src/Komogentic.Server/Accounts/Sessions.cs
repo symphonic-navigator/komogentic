@@ -8,7 +8,10 @@ using MongoDB.Driver;
 namespace Komogentic.Server.Accounts;
 
 /// <summary>A live dashboard session: whose it is, the Komodo JWT it holds and when it ends at the latest.</summary>
-public sealed record ResolvedSession(KomodoUser User, string Jwt, DateTime ExpiresAt);
+public sealed record ResolvedSession(KomodoUser User, string Jwt, DateTime ExpiresAt)
+{
+    public override string ToString() => $"ResolvedSession {{ User = {User}, ExpiresAt = {ExpiresAt:O} }}";
+}
 
 /// <summary>
 /// Dashboard sessions (spec §5, "What is different from Kumbu²"): a random secret in the browser's cookie and, in

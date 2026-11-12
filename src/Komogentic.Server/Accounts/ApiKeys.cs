@@ -59,7 +59,7 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
 
     /// <summary>
     /// Creates an API key for <paramref name="user"/> and, with <paramref name="jwt"/>, its Komodo key
-    /// <c>komogentic/{name}</c> with the same expiry. <see cref="ArgumentException"/> for a name or expiry that
+    /// <c>komogentic/{name}</c> with the same expiry. <see cref="UserInputException"/> for a name or expiry that
     /// <see cref="CredentialRules"/> refuses; <see cref="ApiKeyNameTakenException"/> if another of the user's keys that
     /// is neither revoked, expired nor dead has the name (case aside), checked before Komodo is asked. The key is stored
     /// only once Komodo made its Komodo key; if storing fails, that Komodo key is deleted again, or queued for deletion.
@@ -80,7 +80,9 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
         var nameKey = clean.ToLowerInvariant();
         if (await Docs.Find(k => k.User == user.Id && k.NameKey == nameKey).AnyAsync(ct)) throw new ApiKeyNameTakenException(clean);
 
-        var created = await komodo.CreateApiKeyAsync(jwt, KomodoNamePrefix + clean, expiresAt is { } at ? new DateTimeOffset(at) : null, ct);
+        // From here on not the request's token: a client that hangs up once Komodo made the key must not leave it
+        // made and untracked. Komodo's answer is awaited and the key stored, or deleted again, whatever the client does.
+        var created = await komodo.CreateApiKeyAsync(jwt, KomodoNamePrefix + clean, expiresAt is { } at ? new DateTimeOffset(at) : null, CancellationToken.None);
 
         var id = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
         var key = Secrets.New(Prefix);
@@ -92,14 +94,14 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
             Name = clean,
             NameKey = nameKey,
             Lookup = Lookup(key),
-            Sealed = Sealing.Seal(Sealing.Derive(key, SealLabel), JsonSerializer.SerializeToUtf8Bytes(new SealedKomodoKey(created.Key, created.Secret)), Context(id)),
+            Sealed = Sealing.Seal(Sealing.Derive(key, SealLabel), JsonSerializer.SerializeToUtf8Bytes(new SealedKomodoKey(created.Key, created.Secret)), Context(id, expiresAt)),
             KomodoKey = created.Key,
             CreatedAt = now,
             ExpiresAt = expiresAt,
         };
         try
         {
-            await Docs.InsertOneAsync(doc, cancellationToken: ct);
+            await Docs.InsertOneAsync(doc, cancellationToken: CancellationToken.None);
         }
         catch (Exception e)
         {
@@ -137,28 +139,33 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
         if (doc is null) return false;
         log.LogInformation("User {UserId} revoked API key {KeyId}", user.Id, id);
 
-        // A dead key's Komodo key was queued when it died.
-        if (doc.DeadAt is null) await DiscardAsync(user.Id, jwt, doc.KomodoKey, "revoked", rethrowUnauthorized: true);
+        // A dead key's Komodo key was queued when it died, and may still exist (an unreadable key's does): deleting it
+        // again is harmless, as Komodo's "no such key" counts as done.
+        await DiscardAsync(user.Id, jwt, doc.KomodoKey, "revoked", rethrowUnauthorized: true);
         return true;
     }
 
     /// <summary>
     /// The key behind a presented bearer, or null if it isn't one, is unknown, revoked, expired or dead, or its Komodo key
-    /// doesn't open. Never calls Komodo, never logs anything of the key. Notes the use at most once a minute.
+    /// doesn't open; <c>Known</c> whether it is one of the keys at all (a revoked one too), so that an agent retrying an
+    /// old key is not taken for someone guessing. A key whose Komodo key no longer opens (its document changed: its
+    /// expiry is part of the seal's context) becomes dead with the reason <c>unreadable</c>. Never calls Komodo, never
+    /// logs anything of the key. Notes the use at most once a minute.
     /// </summary>
-    public async Task<ResolvedApiKey?> ResolveAsync(string presented, CancellationToken ct)
+    public async Task<(ResolvedApiKey? Key, bool Known)> ResolveAsync(string presented, CancellationToken ct)
     {
-        if (!Secrets.IsWellFormed(presented, Prefix)) return null;
+        if (!Secrets.IsWellFormed(presented, Prefix)) return (null, false);
         await EnsureReadyAsync(ct);
         var lookup = Lookup(presented);
         var doc = await Docs.Find(k => k.Lookup == lookup).FirstOrDefaultAsync(ct);
         var now = Now;
-        if (doc is null || doc.RevokedAt is not null || doc.DeadAt is not null || now >= doc.ExpiresAt) return null;
+        if (doc is null) return (null, false);
+        if (doc.RevokedAt is not null || doc.DeadAt is not null || now >= doc.ExpiresAt) return (null, true);
 
         SealedKomodoKey? komodoKey;
         try
         {
-            komodoKey = JsonSerializer.Deserialize<SealedKomodoKey>(Sealing.Open(Sealing.Derive(presented, SealLabel), doc.Sealed, Context(doc.Id)));
+            komodoKey = JsonSerializer.Deserialize<SealedKomodoKey>(Sealing.Open(Sealing.Derive(presented, SealLabel), doc.Sealed, Context(doc.Id, doc.ExpiresAt)));
         }
         catch (Exception e) when (e is CryptographicException or JsonException)
         {
@@ -167,8 +174,9 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
 
         if (komodoKey is null)
         {
-            log.LogWarning("API key {KeyId} matched but its Komodo key does not open", doc.Id);
-            return null;
+            log.LogWarning("API key {KeyId} matched but its Komodo key does not open: it is marked dead", doc.Id);
+            await MarkDeadAsync(doc.Id, doc.KomodoKey, "unreadable", CancellationToken.None);
+            return (null, true);
         }
 
         if (doc.LastUsedAt is not { } lastUsed || now - lastUsed >= LastUsedGranularity)
@@ -181,7 +189,7 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
                 cancellationToken: ct);
         }
 
-        return new ResolvedApiKey(doc.Id, new KomodoUser(doc.User, doc.Username), doc.Name, new KomodoAuth.Key(komodoKey.Key, komodoKey.Secret), doc.ExpiresAt);
+        return (new ResolvedApiKey(doc.Id, new KomodoUser(doc.User, doc.Username), doc.Name, new KomodoAuth.Key(komodoKey.Key, komodoKey.Secret), doc.ExpiresAt), true);
     }
 
     /// <summary>
@@ -198,7 +206,8 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
             cancellationToken: ct);
         if (doc is null) return;
         log.LogWarning("API key {KeyId} of user {UserId} is dead: {Reason}", id, doc.User, reason);
-        await pending.AddAsync(null, doc.User, komodoKey, "dead", ct);
+        // Not the request's token: the key is dead now, and its Komodo key must be queued whatever the caller does.
+        await pending.AddAsync(null, doc.User, komodoKey, "dead", CancellationToken.None);
     }
 
     /// <summary>
@@ -234,8 +243,10 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
     /// <summary>Finds the key without storing it; HKDF suffices, as the key is random.</summary>
     private static string Lookup(string key) => Convert.ToHexStringLower(Sealing.Lookup(key, LookupLabel));
 
-    /// <summary>The associated data: the sealed Komodo key opens only as this API key's.</summary>
-    private static string Context(string id) => $"api-key:{id}";
+    /// <summary>The associated data: the sealed Komodo key opens only as this API key's, and only with the expiry it was
+    /// made with, so that whoever may write the database can't extend a key.</summary>
+    private static string Context(string id, DateTime? expiresAt) =>
+        $"api-key:{id}:{(expiresAt is { } at ? new DateTimeOffset(DateTime.SpecifyKind(at, DateTimeKind.Utc)).ToUnixTimeMilliseconds().ToString(System.Globalization.CultureInfo.InvariantCulture) : "none")}";
 
     /// <summary>Creates the indexes once per process; lazy, so the server starts before MongoDB is reachable.</summary>
     private async Task EnsureReadyAsync(CancellationToken ct)
@@ -262,7 +273,10 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
     /// <summary>What is sealed under the API key: its Komodo key and that key's secret.</summary>
     private sealed record SealedKomodoKey(
         [property: JsonPropertyName("key")] string Key,
-        [property: JsonPropertyName("secret")] string Secret);
+        [property: JsonPropertyName("secret")] string Secret)
+    {
+        public override string ToString() => $"SealedKomodoKey {{ Key = {Key} }}";
+    }
 }
 
 /// <summary>An API key as stored (collection <c>api_keys</c>).</summary>
@@ -317,7 +331,7 @@ public sealed class ApiKeyDocument
     [BsonElement("deadAt"), BsonIgnoreIfNull]
     public DateTime? DeadAt { get; set; }
 
-    /// <summary>Why the key is dead: <c>komodo_key_rejected</c>.</summary>
+    /// <summary>Why the key is dead: <c>komodo_key_rejected</c>, <c>unreadable</c>.</summary>
     [BsonElement("reason"), BsonIgnoreIfNull]
     public string? Reason { get; set; }
 }

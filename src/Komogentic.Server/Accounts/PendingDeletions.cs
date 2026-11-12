@@ -16,6 +16,9 @@ public sealed class PendingDeletions(IMongoDatabase db, KomodoClient komodo, Tim
 {
     internal const string CollectionName = "pending_deletions";
 
+    /// <summary>A key Komodo refused to delete this often, for reasons of the key itself, is given up.</summary>
+    internal const int MaxAttempts = 10;
+
     private volatile bool _ready;
 
     private IMongoCollection<PendingDeletionDocument> Docs { get; } = db.GetCollection<PendingDeletionDocument>(CollectionName);
@@ -49,8 +52,10 @@ public sealed class PendingDeletions(IMongoDatabase db, KomodoClient komodo, Tim
 
     /// <summary>
     /// Deletes each of the user's queued keys whose time has come in Komodo with <paramref name="jwt"/>, and takes it
-    /// off the list once Komodo deleted it or no longer has it. Any other failure keeps it for the next time; Komodo's
-    /// failures never throw, so a sign-in or consent never fails over a key nobody can use anyway.
+    /// off the list once Komodo deleted it or no longer has it. A key Komodo says is another user's (403), or refused
+    /// for the key's own sake more than <see cref="MaxAttempts"/> times, is dropped with a warning; any other failure
+    /// keeps it for the next time. Komodo's failures never throw, so a sign-in or consent never fails over a key nobody
+    /// can use anyway.
     /// </summary>
     public async Task DrainAsync(string userId, KomodoAuth.Jwt jwt, CancellationToken ct)
     {
@@ -64,11 +69,40 @@ public sealed class PendingDeletions(IMongoDatabase db, KomodoClient komodo, Tim
             {
                 await komodo.DeleteApiKeyAsync(jwt, doc.KomodoKey, ct);
             }
+            catch (KomodoException e) when (e.Status == 403)
+            {
+                // mogh_auth_server api/manage/api_key.rs: "Api key does not belong to user". No JWT of this user will
+                // ever delete it; nobody holds its secret either.
+                log.LogWarning("A Komodo key pending deletion for user {UserId} is dropped: Komodo says it does not belong to that user (HTTP 403)", userId);
+                await Docs.DeleteOneAsync(d => d.Id == doc.Id, ct);
+                continue;
+            }
             catch (KomodoException e)
             {
-                log.LogWarning("A Komodo key pending deletion for user {UserId} stays queued: Komodo answered {Kind} (HTTP {Status})", userId, e.Kind, e.Status);
-                // Each of the others would be refused alike.
-                if (e.Kind is KomodoErrorKind.Unauthorized or KomodoErrorKind.Unreachable or KomodoErrorKind.RateLimited) break;
+                // Each of the others would be refused alike, and none of it is about the key: not an attempt.
+                if (e.Kind is KomodoErrorKind.Unauthorized or KomodoErrorKind.Unreachable or KomodoErrorKind.RateLimited)
+                {
+                    log.LogWarning("Komodo keys pending deletion for user {UserId} stay queued: Komodo answered {Kind} (HTTP {Status})", userId, e.Kind, e.Status);
+                    break;
+                }
+
+                var tried = await Docs.FindOneAndUpdateAsync(
+                    d => d.Id == doc.Id,
+                    Builders<PendingDeletionDocument>.Update.Inc(d => d.Attempts, 1),
+                    new FindOneAndUpdateOptions<PendingDeletionDocument> { ReturnDocument = ReturnDocument.After },
+                    ct);
+                if (tried is { Attempts: > MaxAttempts })
+                {
+                    log.LogWarning(
+                        "A Komodo key pending deletion for user {UserId} is dropped after {Attempts} attempts: Komodo answered {Kind} (HTTP {Status})",
+                        userId, tried.Attempts, e.Kind, e.Status);
+                    await Docs.DeleteOneAsync(d => d.Id == doc.Id, ct);
+                }
+                else
+                {
+                    log.LogWarning("A Komodo key pending deletion for user {UserId} stays queued: Komodo answered {Kind} (HTTP {Status})", userId, e.Kind, e.Status);
+                }
+
                 continue;
             }
 
@@ -111,6 +145,10 @@ public sealed class PendingDeletionDocument
 
     [BsonElement("createdAt")]
     public DateTime CreatedAt { get; set; }
+
+    /// <summary>How often Komodo refused to delete it for reasons of the key itself.</summary>
+    [BsonElement("attempts")]
+    public int Attempts { get; set; }
 
     /// <summary>Not deleted before this time; null for at once.</summary>
     [BsonElement("notBefore")]

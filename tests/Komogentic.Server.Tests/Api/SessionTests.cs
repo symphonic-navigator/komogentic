@@ -150,6 +150,40 @@ public sealed class SessionTests : IDisposable
     }
 
     [Fact]
+    public async Task A_refused_cross_origin_post_does_not_move_the_idle_clock()
+    {
+        var session = await _api.SignInAsync("anna", AnnaPassword);
+        _time.Advance(TimeSpan.FromMinutes(29));
+
+        using (var forged = await _api.SendAsync(HttpMethod.Delete, "/api/session", session: session, origin: "https://elsewhere.example.org"))
+            Assert.Equal(HttpStatusCode.Forbidden, forged.StatusCode);
+        _time.Advance(TimeSpan.FromMinutes(2));
+        using var idle = await _api.SendAsync(HttpMethod.Get, "/api/session", session: session);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, idle.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Two_session_cookies_are_refused(bool ownFirst)
+    {
+        var session = await _api.SignInAsync("anna", AnnaPassword);
+        // A sibling subdomain can set a cookie of the same name for the parent domain ("cookie tossing").
+        var tossed = await _api.SignInAsync("anna", AnnaPassword);
+        var cookies = ownFirst ? $"kgt_session={session}; other=1; kgt_session={tossed}" : $"kgt_session={tossed};kgt_session={session}";
+        using var request = Dashboard.Request(HttpMethod.Get, "/api/session");
+        request.Headers.Add("Cookie", cookies);
+
+        using var response = await _api.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false, BaseAddress = new Uri(AppFactory.PublicUrl) })
+            .SendAsync(request, Ct);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        using var alone = await _api.SendAsync(HttpMethod.Get, "/api/session", session: tossed);
+        Assert.Equal(HttpStatusCode.OK, alone.StatusCode);
+    }
+
+    [Fact]
     public async Task Session_ends_after_12_hours()
     {
         var session = await _api.SignInAsync("anna", AnnaPassword);
@@ -283,6 +317,37 @@ public sealed class SessionTests : IDisposable
 
         Assert.True(_app.Komodo.ApiKeys.Single(k => k.Key == later.Key).Deleted);
         Assert.Empty(await PendingKeysAsync());
+    }
+
+    [Fact]
+    public async Task A_key_of_someone_else_is_dropped_from_the_queue()
+    {
+        var deletions = _api.Services.GetRequiredService<PendingDeletions>();
+        var bens = _app.Komodo.IssueKey("u-ben", "komogentic/bens");
+        await deletions.AddAsync(null, AnnaId, bens.Key, "revoked", Ct);
+
+        await deletions.DrainAsync(AnnaId, new KomodoAuth.Jwt(_app.Komodo.IssueJwt(AnnaId)), Ct);
+
+        Assert.DoesNotContain(bens.Key, await PendingKeysAsync());
+        Assert.False(_app.Komodo.ApiKeys.Single(k => k.Key == bens.Key).Deleted);
+        Assert.Contains(_log.Lines, l => l.StartsWith("Warning ", StringComparison.Ordinal) && l.Contains("does not belong", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_key_tried_more_than_ten_times_is_dropped()
+    {
+        var deletions = _api.Services.GetRequiredService<PendingDeletions>();
+        var stuck = _app.Komodo.IssueKey(AnnaId, "komogentic/stuck");
+        await deletions.AddAsync(null, AnnaId, stuck.Key, "revoked", Ct);
+        _app.Komodo.Fail("DeleteApiKey", 500, FakeKomodo.ErrorBody("something odd"));
+        var jwt = new KomodoAuth.Jwt(_app.Komodo.IssueJwt(AnnaId));
+
+        for (var i = 0; i < 10; i++) await deletions.DrainAsync(AnnaId, jwt, Ct);
+        Assert.Contains(stuck.Key, await PendingKeysAsync());
+        await deletions.DrainAsync(AnnaId, jwt, Ct);
+
+        Assert.DoesNotContain(stuck.Key, await PendingKeysAsync());
+        Assert.Contains(_log.Lines, l => l.StartsWith("Warning ", StringComparison.Ordinal) && l.Contains("11 attempts", StringComparison.Ordinal));
     }
 
     [Fact]

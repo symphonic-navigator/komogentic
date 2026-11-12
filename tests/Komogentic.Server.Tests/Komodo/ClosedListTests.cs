@@ -102,6 +102,7 @@ public sealed partial class ClosedListTests
     private static readonly Dictionary<Type, string> OtherHttpUsers = new()
     {
         [typeof(ClientMetadataFetcher)] = "a client's metadata document, with the named client \"cimd\" (ClientMetadataServices.HttpClientName)",
+        [typeof(Komogentic.Server.Net.PublicAddresses)] = "the \"cimd\" client's connect callback: a socket to a public address only, the SSRF guard",
     };
 
     private const BindingFlags Everything = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
@@ -128,6 +129,22 @@ public sealed partial class ClosedListTests
     }
 
     [Fact]
+    public async Task Send_refuses_a_call_outside_the_list()
+    {
+        var make = typeof(KomodoCall).GetConstructors(BindingFlags.NonPublic | BindingFlags.Instance).Single();
+        var send = typeof(KomodoClient).GetMethod("SendAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        // Nothing listens there: a call that got past the guard would fail as unreachable, not as refused.
+        var client = new KomodoClient(new HttpClient { BaseAddress = new Uri("http://127.0.0.1:9/") });
+
+        foreach (var (name, path) in new[] { ("StopStack", "/execute"), ("ListStacks", "/read") })
+        {
+            var rogue = make.Invoke([name, path]);
+            var refusal = await Assert.ThrowsAsync<InvalidOperationException>(() => (Task)send.Invoke(client, [rogue, null, new { }, CancellationToken.None])!);
+            Assert.Contains("closed list", refusal.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void Calls_are_made_only_by_their_static_constructor()
     {
         var makers = ServerMethods()
@@ -151,9 +168,75 @@ public sealed partial class ClosedListTests
         return type;
     }
 
-    /// <summary>Building a request, creating a client, or a method of HttpClient that sends one.</summary>
+    /// <summary>The other ways .NET has of reaching another host: none belongs in the server.</summary>
+    private static readonly Type[] OtherSenders =
+    [
+#pragma warning disable SYSLIB0014 // WebRequest and WebClient are obsolete, which is why they are looked for here.
+        typeof(System.Net.WebRequest), typeof(System.Net.WebClient),
+#pragma warning restore SYSLIB0014
+        typeof(System.Net.Sockets.Socket), typeof(System.Net.Sockets.TcpClient), typeof(System.Net.Sockets.UdpClient),
+        typeof(System.Net.WebSockets.ClientWebSocket),
+    ];
+
+    private static bool IsOtherSender(MemberInfo member) =>
+        (member as Type ?? member.DeclaringType) is { } t && OtherSenders.Any(s => t.IsAssignableTo(s));
+
+    /// <summary>The names of IHttpClientFactory's clients the server may ask for: OtherHttpUsers' own.</summary>
+    private static readonly string[] AllowedClientNames = [ClientMetadataServices.HttpClientName];
+
+    private static bool CreatesFactoryClient(MemberInfo member) =>
+        member is MethodInfo { Name: "CreateClient" } m
+        && (m.DeclaringType == typeof(IHttpClientFactory) || m.DeclaringType == typeof(HttpClientFactoryExtensions));
+
+    [Fact]
+    public void Factory_clients_are_asked_for_only_by_allowed_names()
+    {
+        var offending = ServerMethods()
+            .Where(m => References(m).Any(CreatesFactoryClient))
+            .Where(m => !OtherHttpUsers.ContainsKey(Outermost(m.DeclaringType!))
+                        // The extension without a name asks for the default client, whose handler nobody reviewed; a
+                        // name that isn't a literal can't be checked.
+                        || ClientNames(m).Any(name => name is null || !AllowedClientNames.Contains(name)))
+            .Select(m => $"{m.DeclaringType}.{m.Name}")
+            .Distinct()
+            .ToList();
+        Assert.Empty(offending);
+        Assert.Contains(ServerMethods(), m => References(m).Any(CreatesFactoryClient));
+    }
+
+    /// <summary>For each CreateClient call in the method, the name it passes: the string literal loaded just before
+    /// the call, else null (no name, or one computed).</summary>
+    private static IEnumerable<string?> ClientNames(MethodBase method)
+    {
+        var il = method.GetMethodBody()?.GetILAsByteArray();
+        if (il is null) yield break;
+        string? previous = null;
+        foreach (var (op, offset) in Instructions(il))
+        {
+            if (op.OperandType == OperandType.InlineMethod)
+            {
+                MemberInfo? member = null;
+                try
+                {
+                    member = method.Module.ResolveMember(BitConverter.ToInt32(il, offset));
+                }
+                catch (ArgumentException)
+                {
+                }
+
+                if (member is not null && CreatesFactoryClient(member))
+                    yield return member.DeclaringType == typeof(IHttpClientFactory) ? previous : null;
+            }
+
+            previous = op.OperandType == OperandType.InlineString ? method.Module.ResolveString(BitConverter.ToInt32(il, offset)) : null;
+        }
+    }
+
+    /// <summary>Building a request, creating a client, a method of HttpClient that sends one, or any other way of
+    /// reaching a host (<see cref="OtherSenders"/>).</summary>
     private static bool SendsOrBuildsRequests(MemberInfo member) => member switch
     {
+        _ when IsOtherSender(member) => true,
         Type t => t == typeof(HttpRequestMessage),
         _ when member.DeclaringType == typeof(HttpRequestMessage) || member.DeclaringType == typeof(System.Net.Http.Json.HttpClientJsonExtensions) => true,
         ConstructorInfo c => c.DeclaringType == typeof(HttpClient) || c.DeclaringType == typeof(HttpMessageInvoker),
@@ -175,7 +258,7 @@ public sealed partial class ClosedListTests
     private static bool IsHttpSending(MemberInfo member)
     {
         Type[] sending = [typeof(HttpRequestMessage), typeof(HttpClient), typeof(HttpMessageInvoker), typeof(System.Net.Http.Json.HttpClientJsonExtensions)];
-        return member is Type t ? sending.Contains(t) : sending.Contains(member.DeclaringType);
+        return IsOtherSender(member) || CreatesFactoryClient(member) || (member is Type t ? sending.Contains(t) : sending.Contains(member.DeclaringType));
     }
 
     private static IEnumerable<MethodBase> Bodies(MethodBase method)

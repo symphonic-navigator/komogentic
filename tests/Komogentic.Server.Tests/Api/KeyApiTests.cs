@@ -59,6 +59,7 @@ public sealed class KeyApiTests : IDisposable
         _app.Komodo.Down = false;
         _app.Komodo.ClearFailures();
         _app.Komodo.Delay("CreateApiKey", TimeSpan.Zero);
+        _app.Komodo.DelayAnswer("CreateApiKey", TimeSpan.Zero);
     }
 
     [Fact]
@@ -155,14 +156,126 @@ public sealed class KeyApiTests : IDisposable
 
         using var revoke = await _api.SendAsync(HttpMethod.Delete, $"/api/keys/{id}", session: session);
 
-        Assert.Equal(HttpStatusCode.Unauthorized, revoke.StatusCode);
-        Assert.Equal("Your Komodo sign-in has ended; sign in again.", await Dashboard.ErrorAsync(revoke));
+        // The key is revoked: that is the answer. The session ends with it, the cookie cleared.
+        Assert.Equal(HttpStatusCode.NoContent, revoke.StatusCode);
+        Assert.StartsWith(Dashboard.Cookie + "=;", Dashboard.SetCookie(revoke));
         using (var after = await _api.SendAsync(HttpMethod.Get, "/api/session", session: session))
             Assert.Equal(HttpStatusCode.Unauthorized, after.StatusCode);
         // The key is revoked all the same, and its Komodo key waits for the next sign-in.
         Assert.Equal([KomodoKeys().Single().Key], await PendingAsync());
         Assert.Equal("revoked", await StateAsync(await SignInAsync(), id));
         Assert.True(KomodoKeys().Single().Deleted);
+    }
+
+    [Fact]
+    public async Task Revoke_of_a_dead_key_deletes_its_komodo_key()
+    {
+        var session = await SignInAsync();
+        var (id, _) = await CreateAsync(session, "Hermes");
+        var komodoKey = KomodoKeys().Single().Key;
+        await _api.Services.GetRequiredService<ApiKeys>().MarkDeadAsync(id, komodoKey, "komodo_key_rejected", Ct);
+
+        using var revoke = await _api.SendAsync(HttpMethod.Delete, $"/api/keys/{id}", session: session);
+
+        Assert.Equal(HttpStatusCode.NoContent, revoke.StatusCode);
+        Assert.True(KomodoKeys().Single().Deleted);
+        Assert.Equal("revoked", await StateAsync(session, id));
+    }
+
+    [Fact]
+    public async Task Revoked_key_retries_do_not_lock_out_valid_keys()
+    {
+        var session = await SignInAsync();
+        var (old, stale) = await CreateAsync(session, "Old agent");
+        var (_, valid) = await CreateAsync(session, "Hermes");
+        using (var revoke = await _api.SendAsync(HttpMethod.Delete, $"/api/keys/{old}", session: session))
+            Assert.Equal(HttpStatusCode.NoContent, revoke.StatusCode);
+        var address = Dashboard.NewAddress();
+
+        for (var i = 0; i < 25; i++)
+        {
+            using var refused = await McpAsync(stale, address);
+            Assert.Equal(HttpStatusCode.Unauthorized, refused.StatusCode);
+        }
+
+        using var works = await McpAsync(valid, address);
+        Assert.Equal(HttpStatusCode.OK, works.StatusCode);
+    }
+
+    [Fact]
+    public async Task Creating_a_key_survives_a_cancelled_request()
+    {
+        await SignInAsync();
+        var keys = _api.Services.GetRequiredService<ApiKeys>();
+        var jwt = new Server.Komodo.KomodoAuth.Jwt(_app.Komodo.IssueJwt(_userId));
+        // Komodo makes the key at once; its answer comes after the client has gone.
+        _app.Komodo.DelayAnswer("CreateApiKey", TimeSpan.FromMilliseconds(400));
+        using var hangUp = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+
+        try
+        {
+            await keys.CreateAsync(new KomodoUser(_userId, _username), jwt, "Hung up", null, hangUp.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        await Task.Delay(TimeSpan.FromMilliseconds(600), Ct);
+        var komodoKey = Assert.Single(KomodoKeys(), k => k.Name == "komogentic/Hung up");
+        var stored = await _app.Database.GetCollection<ApiKeyDocument>("api_keys").Find(k => k.KomodoKey == komodoKey.Key).AnyAsync(Ct);
+        Assert.True(stored || komodoKey.Deleted || (await PendingAsync()).Contains(komodoKey.Key), "Komodo's key is neither stored, deleted nor queued");
+    }
+
+    [Fact]
+    public async Task Extended_expiry_does_not_open_the_key()
+    {
+        var session = await SignInAsync();
+        var (id, secret) = await CreateAsync(session, "Hermes", 30);
+        var docs = _app.Database.GetCollection<ApiKeyDocument>("api_keys");
+        var doc = await docs.Find(k => k.Id == id).SingleAsync(Ct);
+
+        // Someone who may write the database moves the expiry a year on.
+        await docs.UpdateOneAsync(k => k.Id == id, Builders<ApiKeyDocument>.Update.Set(k => k.ExpiresAt, doc.ExpiresAt!.Value.AddDays(365)), cancellationToken: Ct);
+        using var refused = await McpAsync(secret);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, refused.StatusCode);
+        var listed = await KeyAsync(session, id);
+        Assert.Equal(("dead", "unreadable"), (listed.GetProperty("state").GetString(), listed.GetProperty("reason").GetString()));
+    }
+
+    [Fact]
+    public async Task Unreadable_key_is_marked_dead()
+    {
+        var session = await SignInAsync();
+        var (id, secret) = await CreateAsync(session, "Hermes");
+        var docs = _app.Database.GetCollection<ApiKeyDocument>("api_keys");
+        var doc = await docs.Find(k => k.Id == id).SingleAsync(Ct);
+        var damaged = (byte[])doc.Sealed.Clone();
+        damaged[^1] ^= 1;
+        await docs.UpdateOneAsync(k => k.Id == id, Builders<ApiKeyDocument>.Update.Set(k => k.Sealed, damaged), cancellationToken: Ct);
+
+        using var refused = await McpAsync(secret);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, refused.StatusCode);
+        var listed = await KeyAsync(session, id);
+        Assert.Equal(("dead", "unreadable"), (listed.GetProperty("state").GetString(), listed.GetProperty("reason").GetString()));
+        Assert.Equal([doc.KomodoKey], await PendingAsync());
+    }
+
+    [Theory]
+    [InlineData("/mcp/c")]
+    [InlineData("/mcp/c/")]
+    [InlineData("/MCP/C/")]
+    [InlineData("/mcp/c//x")]
+    public async Task Api_key_does_not_open_connection_paths(string path)
+    {
+        var session = await SignInAsync();
+        var (_, secret) = await CreateAsync(session, "Hermes");
+
+        using var request = McpRequest(secret, path: path);
+        using var response = await Client().SendAsync(request, Ct);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 
     [Fact]
@@ -174,7 +287,7 @@ public sealed class KeyApiTests : IDisposable
         using (var listed = await McpAsync(secret))
         {
             Assert.Equal(HttpStatusCode.OK, listed.StatusCode);
-            Assert.Contains("\"result\":{\"tools\":[]", await listed.Content.ReadAsStringAsync(Ct));
+            Assert.Contains("\"name\":\"list_stacks\"", await listed.Content.ReadAsStringAsync(Ct));
         }
 
         using (var revoke = await _api.SendAsync(HttpMethod.Delete, $"/api/keys/{id}", session: session))
@@ -412,9 +525,9 @@ public sealed class KeyApiTests : IDisposable
         _api.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false, BaseAddress = new Uri(AppFactory.PublicUrl) });
 
     /// <summary>A raw MCP <c>tools/list</c>, as an agent sends it over Streamable HTTP.</summary>
-    private static HttpRequestMessage McpRequest(string? bearer, string? address = null)
+    private static HttpRequestMessage McpRequest(string? bearer, string? address = null, string path = "/mcp")
     {
-        var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
+        var request = new HttpRequestMessage(HttpMethod.Post, path)
         {
             Content = new StringContent("""{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}""", Encoding.UTF8, "application/json"),
         };

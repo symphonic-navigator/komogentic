@@ -125,6 +125,7 @@ public sealed class FakeKomodo : IAsyncDisposable
     private readonly Dictionary<string, Queue<(int Status, string Body)>> _failNext = [];
     private readonly Dictionary<string, (int Status, string Body)> _failAlways = [];
     private readonly ConcurrentDictionary<string, TimeSpan> _delays = [];
+    private readonly ConcurrentDictionary<string, TimeSpan> _answerDelays = [];
     private readonly List<FakeRequest> _requests = [];
     private readonly List<string> _violations = [];
     private readonly List<string> _jwts = [];
@@ -295,6 +296,10 @@ public sealed class FakeKomodo : IAsyncDisposable
     /// <summary>Requests of <paramref name="type"/> (or of every type, with null) wait this long before being answered.</summary>
     public void Delay(string? type, TimeSpan delay) => _delays[type ?? "*"] = delay;
 
+    /// <summary>Requests of <paramref name="type"/> are carried out at once, and their answer is sent this much later: a
+    /// client that gives up meanwhile never learns what Komodo did.</summary>
+    public void DelayAnswer(string type, TimeSpan delay) => _answerDelays[type] = delay;
+
     public static string ErrorBody(string error) => JsonSerializer.Serialize(new { error, trace = Array.Empty<string>() });
 
     public Task StopAsync() => _app.StopAsync();
@@ -354,7 +359,20 @@ public sealed class FakeKomodo : IAsyncDisposable
             }
         }
 
-        await WriteAsync(ctx, Respond(ctx, path, type, parameters));
+        var answer = Respond(ctx, path, type, parameters);
+        if (_answerDelays.TryGetValue(type, out var late) && late > TimeSpan.Zero)
+        {
+            try
+            {
+                await Task.Delay(late, ctx.RequestAborted);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+
+        await WriteAsync(ctx, answer);
     }
 
     private Answer Respond(HttpContext ctx, string path, string type, JsonElement parameters)

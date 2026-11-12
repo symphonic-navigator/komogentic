@@ -5,7 +5,7 @@ using System.Text;
 namespace Komogentic.Server.Accounts;
 
 /// <summary>What connections and API keys share: a name a person can tell apart, and an expiry of 30, 90 or 365
-/// days, or never. Each check throws an <see cref="ArgumentException"/> with a sentence for the dashboard.</summary>
+/// days, or never. Each check throws a <see cref="UserInputException"/> with a sentence for the dashboard.</summary>
 public static class CredentialRules
 {
     public const int MaxNameLength = 60;
@@ -17,10 +17,10 @@ public static class CredentialRules
     public static string Name(string name, string noun)
     {
         var clean = name.Normalize(NormalizationForm.FormC).Trim();
-        if (clean.Length is 0 or > MaxNameLength) throw new ArgumentException($"{noun}'s name has 1 to {MaxNameLength} characters.", nameof(name));
+        if (clean.Length is 0 or > MaxNameLength) throw new UserInputException($"{noun}'s name has 1 to {MaxNameLength} characters.");
         // Format characters (zero-width, bidi overrides) are invisible: "claude​" would show as "claude".
         if (clean.Any(c => char.IsControl(c) || char.GetUnicodeCategory(c) == UnicodeCategory.Format))
-            throw new ArgumentException($"{noun}'s name can't contain control or invisible formatting characters.", nameof(name));
+            throw new UserInputException($"{noun}'s name can't contain control or invisible formatting characters.");
         return clean;
     }
 
@@ -30,7 +30,7 @@ public static class CredentialRules
     {
         if (expiresInDays is not { } days) return null;
         if (!ExpiryDays.Contains(days))
-            throw new ArgumentException($"{noun} expires after {string.Join(", ", ExpiryDays.Order())} days, or never.", nameof(expiresInDays));
+            throw new UserInputException($"{noun} expires after {string.Join(", ", ExpiryDays.Order())} days, or never.");
         return Milliseconds(now.AddDays(days));
     }
 
@@ -39,3 +39,7 @@ public static class CredentialRules
 
 /// <summary>Another live credential of the user has this name (case aside): a 409 in the dashboard.</summary>
 public abstract class CredentialNameTakenException(string message) : Exception(message);
+
+/// <summary>Input a person can correct (a name, an expiry): a 400 in the dashboard, with this sentence. Its own type, so
+/// that no other <see cref="ArgumentException"/>, which comes from a bug, is ever shown as one.</summary>
+public sealed class UserInputException(string message) : Exception(message);

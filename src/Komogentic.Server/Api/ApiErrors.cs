@@ -68,11 +68,11 @@ public static class ApiErrors
         {
             return Result(StatusCodes.Status409Conflict, e.Message);
         }
-        // Exactly ArgumentException: the services throw it for input they refuse, with a sentence meant for the
-        // user. Its subclasses (ArgumentNullException, ...) come from bugs and say nothing a user could act on.
-        catch (ArgumentException e) when (e.GetType() == typeof(ArgumentException))
+        // The services' refusals of input, with a sentence meant for the user. An ArgumentException comes from a bug
+        // and says nothing a user could act on: it stays a 500, without its message.
+        catch (UserInputException e)
         {
-            return Result(StatusCodes.Status400BadRequest, Sentence(e));
+            return Result(StatusCodes.Status400BadRequest, e.Message);
         }
     }
 
@@ -109,8 +109,4 @@ public static class ApiErrors
             }
         }
     }
-
-    /// <summary>The exception's message without the " (Parameter 'x')" that .NET appends.</summary>
-    private static string Sentence(ArgumentException e) =>
-        e.ParamName is { } name ? e.Message.Replace($" (Parameter '{name}')", "", StringComparison.Ordinal) : e.Message;
 }

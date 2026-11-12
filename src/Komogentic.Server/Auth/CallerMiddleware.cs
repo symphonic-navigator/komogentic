@@ -39,7 +39,8 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
 
         RequestCaller? caller;
         if (IsUnder(context, "/api")) caller = await SessionCallerAsync(context);
-        else if (ConnectionIdSegment(context) is { } id) caller = await ConnectionCallerAsync(context, id);
+        // Everything under /mcp/c is a connection's, /mcp/c and /mcp/c/ without an id too: never the API keys'.
+        else if (IsUnder(context, "/mcp/c")) caller = await ConnectionCallerAsync(context, ConnectionIdSegment(context) ?? "");
         else
         {
             (caller, var retryAfter) = await ApiKeyCallerAsync(context);
@@ -66,10 +67,31 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
     /// user's session. A bearer header is not read here.
     /// </summary>
     private async Task<RequestCaller?> SessionCallerAsync(HttpContext context) =>
-        context.Request.Cookies.TryGetValue(SessionCookie, out var secret)
+        SessionCookies(context) == 1
+        && context.Request.Cookies.TryGetValue(SessionCookie, out var secret)
         && await sessions.ResolveAsync(secret, context.RequestAborted) is { } session
             ? RequestCaller.ForSession(session.User, session.Jwt, session.ExpiresAt)
             : null;
+
+    /// <summary>
+    /// How many <see cref="SessionCookie"/> cookies the request carries. More than one is refused: a sibling subdomain
+    /// can set one of that name for the parent domain ("cookie tossing"), and which of the two a parser keeps is not
+    /// the user's choice. Counted case-insensitively, as <c>Request.Cookies</c> looks them up.
+    /// </summary>
+    private static int SessionCookies(HttpContext context)
+    {
+        var count = 0;
+        foreach (var header in context.Request.Headers.Cookie)
+        {
+            foreach (var pair in (header ?? "").Split(';'))
+            {
+                var name = pair.Split('=', 2)[0].Trim();
+                if (name.Equals(SessionCookie, StringComparison.OrdinalIgnoreCase)) count++;
+            }
+        }
+
+        return count;
+    }
 
     /// <summary>
     /// Plain <c>/mcp</c>: an API key as <c>Authorization: Bearer kgt_…</c>, nothing else (no cookie: see
@@ -85,9 +107,10 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
         var ip = WrongKeyLimiter.Partition(context.Connection.RemoteIpAddress);
         if (wrongKeys.TryReserve(ip) is { } retryAfter) return (null, retryAfter);
         ResolvedApiKey? key;
+        bool known;
         try
         {
-            key = await apiKeys.ResolveAsync(header[BearerScheme.Length..].Trim(), context.RequestAborted);
+            (key, known) = await apiKeys.ResolveAsync(header[BearerScheme.Length..].Trim(), context.RequestAborted);
         }
         catch
         {
@@ -98,7 +121,10 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
 
         if (key is null)
         {
-            wrongKeys.Failed(ip);
+            // A key that exists but no longer opens (revoked, expired, dead) is an agent behind the times, not a guess:
+            // counting it would let one stale agent lock every valid key of its address out.
+            if (known) wrongKeys.Release(ip);
+            else wrongKeys.Failed(ip);
             return (null, null);
         }
 

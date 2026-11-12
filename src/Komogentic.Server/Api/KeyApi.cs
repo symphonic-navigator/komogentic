@@ -9,7 +9,10 @@ namespace Komogentic.Server.Api;
 public sealed record CreateKeyRequest(string Name, int? ExpiresInDays = null);
 
 /// <summary>A new API key: shown once, in this answer only.</summary>
-public sealed record CreatedKeyView(ApiKeyInfo Key, string Secret);
+public sealed record CreatedKeyView(ApiKeyInfo Key, string Secret)
+{
+    public override string ToString() => $"CreatedKeyView {{ Key = {Key} }}";
+}
 
 /// <summary>The dashboard's API keys (spec §2, step 4), for the signed-in user only: an agent's own key never manages keys.</summary>
 public static class KeyApi
@@ -32,10 +35,24 @@ public static class KeyApi
         return TypedResults.Created($"/api/keys/{info.Id}", new CreatedKeyView(info, secret));
     }
 
-    private static async Task<Results<NoContent, JsonHttpResult<ApiError>>> RevokeAsync(string id, RequestCaller caller, ApiKeys keys, CancellationToken ct)
+    private static async Task<Results<NoContent, JsonHttpResult<ApiError>>> RevokeAsync(
+        string id, RequestCaller caller, ApiKeys keys, HttpContext http, CancellationToken ct)
     {
         var (user, jwt) = Session(caller);
-        return await keys.RevokeAsync(user, jwt, id, ct)
+        bool revoked;
+        try
+        {
+            revoked = await keys.RevokeAsync(user, jwt, id, ct);
+        }
+        catch (KomodoException e) when (e.Kind == KomodoErrorKind.Unauthorized)
+        {
+            // The key is revoked and its Komodo key queued for the next sign-in: what was asked is done. Only the JWT
+            // has ended, and with it the session (as ApiErrors.Filter would end it), but a 401 would read as a failed revoke.
+            await SessionApi.EndSessionAsync(http, CancellationToken.None);
+            return TypedResults.NoContent();
+        }
+
+        return revoked
             ? TypedResults.NoContent()
             : TypedResults.Json(new ApiError("You have no such API key, or it is revoked already."), statusCode: StatusCodes.Status404NotFound);
     }

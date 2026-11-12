@@ -59,13 +59,13 @@ public sealed class ConnectionsTests(MongoFixture mongo)
     [InlineData("a​b")]
     [InlineData("a\nb")]
     public async Task Refuses_unusable_names(string name) =>
-        await Assert.ThrowsAsync<ArgumentException>(() => Connections.CreateAsync(Anna, name, null, Ct));
+        await Assert.ThrowsAsync<UserInputException>(() => Connections.CreateAsync(Anna, name, null, Ct));
 
     [Fact]
     public async Task Names_have_at_most_60_characters()
     {
         Assert.Equal(60, (await Connections.CreateAsync(Anna, new string('x', 60), null, Ct)).Name.Length);
-        await Assert.ThrowsAsync<ArgumentException>(() => Connections.CreateAsync(Anna, new string('y', 61), null, Ct));
+        await Assert.ThrowsAsync<UserInputException>(() => Connections.CreateAsync(Anna, new string('y', 61), null, Ct));
     }
 
     [Theory]
@@ -73,7 +73,7 @@ public sealed class ConnectionsTests(MongoFixture mongo)
     [InlineData(7)]
     [InlineData(366)]
     public async Task Refuses_other_expiries(int days) =>
-        await Assert.ThrowsAsync<ArgumentException>(() => Connections.CreateAsync(Anna, "claude", days, Ct));
+        await Assert.ThrowsAsync<UserInputException>(() => Connections.CreateAsync(Anna, "claude", days, Ct));
 
     [Fact]
     public async Task A_name_is_unique_among_the_users_live_connections()

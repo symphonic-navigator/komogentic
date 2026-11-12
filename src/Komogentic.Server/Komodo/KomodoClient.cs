@@ -17,7 +17,7 @@ public abstract record KomodoAuth
     }
 
     /// <summary>A Komodo API key of the calling user, sent as <c>X-Api-Key</c> and <c>X-Api-Secret</c>.</summary>
-    public sealed record Key(string ApiKey, string Secret) : KomodoAuth
+    public sealed record Key(string ApiKey, [property: System.Text.Json.Serialization.JsonIgnore] string Secret) : KomodoAuth
     {
         public override string ToString() => $"KomodoAuth.Key {{ ApiKey = {ApiKey} }}";
     }
@@ -102,7 +102,11 @@ public sealed partial class KomodoClient(HttpClient http)
         var answer = await SendAsync(KomodoCall.GetStack, auth, new { stack = idOrName }, ct);
         return Parse(KomodoCall.GetStack.Name, answer, a => new StackRef(
             a.GetProperty("_id").GetProperty("$oid").GetString() ?? throw new JsonException(),
-            a.GetProperty("name").GetString() ?? throw new JsonException()));
+            a.GetProperty("name").GetString() ?? throw new JsonException(),
+            // StackConfig.swarm_id: a String with a default, so always there; an older Core without it is in Server mode.
+            a.TryGetProperty("config", out var config) && config.TryGetProperty("swarm_id", out var swarm) && swarm.ValueKind == JsonValueKind.String
+                ? swarm.GetString()!
+                : ""));
     }
 
     public async Task<IReadOnlyList<StackService>> ListStackServicesAsync(KomodoAuth auth, string stack, CancellationToken ct)
@@ -163,6 +167,9 @@ public sealed partial class KomodoClient(HttpClient http)
 
     private async Task<JsonElement> SendAsync(KomodoCall call, KomodoAuth? auth, object parameters, CancellationToken ct)
     {
+        // By reference: only the instances of KomodoCalls.All, never one made some other way with a known name.
+        if (!KomodoCalls.All.Any(c => ReferenceEquals(c, call)))
+            throw new InvalidOperationException($"{call.Name} is not in Komogentic's closed list of Komodo calls");
         // Relative to BaseAddress, so that a Komodo behind a path prefix keeps it.
         using var request = new HttpRequestMessage(HttpMethod.Post, call.Path.TrimStart('/'));
         var body = JsonSerializer.SerializeToUtf8Bytes(new { type = call.Name, @params = parameters }, Json);

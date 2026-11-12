@@ -5,6 +5,7 @@ using Komogentic.Server.Api;
 using Komogentic.Server.Auth;
 using Komogentic.Server.Komodo;
 using Komogentic.Server.OAuth;
+using Komogentic.Server.Tools;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.Options;
 using ModelContextProtocol.Protocol;
@@ -80,16 +81,22 @@ builder.Services.AddSingleton<AuthorizationRequests>();
 builder.Services.AddSingleton<OAuthLimits>();
 
 // MCP over Streamable HTTP, stateless (the SDK's default): no Mcp-Session-Id, nothing kept between requests. The
-// tools come with Task 6; until then an empty collection, so that tools/list answers an empty list.
+// collection-expression overload of WithTools: WithTools(typeof(X)) binds the params overload of another meaning and
+// registers nothing. A read-only grant sees and runs the read tools only (ScopeFilter).
+builder.Services.AddSingleton<ICredentialHealth, CredentialHealth>();
 builder.Services.AddMcpServer(o =>
     {
         o.ServerInfo = new Implementation { Name = "komogentic", Version = BuildVersion.Semver };
-        o.ToolCollection = [];
+        o.ServerInstructions = StackTools.ServerInstructions;
+        o.Filters.Request.ListToolsFilters.Add(ScopeFilter.List);
+        o.Filters.Request.CallToolFilters.Add(ScopeFilter.Call);
     })
-    .WithHttpTransport();
+    .WithHttpTransport()
+    .WithTools([typeof(StackTools)]);
 
 var app = builder.Build();
 var options = app.Services.GetRequiredService<IOptions<KomogenticOptions>>().Value;
+app.Logger.LogInformation("deploy_stack and restart_stack wait {Seconds} s by default", StackTools.DefaultWaitSeconds);
 
 if (options.Proxy.Trusted)
 {
@@ -122,8 +129,9 @@ app.UseStaticFiles(webApp);
 // Routing first, so that CallerMiddleware sees the endpoint and its AllowAnonymous.
 app.UseRouting();
 app.UseOAuthCors();
-app.UseMiddleware<CallerMiddleware>();
+// The Origin check before the caller: a refused cross-origin request must not even touch the session (its idle clock).
 app.UseCallerRules(publicUrl);
+app.UseMiddleware<CallerMiddleware>();
 
 app.MapGet("/healthz", () => "ok").AllowAnonymous().ExcludeFromDescription();
 app.MapDiscovery();
