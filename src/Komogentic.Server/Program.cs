@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 using Komogentic.Server;
-using Komogentic.Server.Komodo;
 using Komogentic.Server.Accounts;
+using Komogentic.Server.Api;
+using Komogentic.Server.Auth;
+using Komogentic.Server.Komodo;
 using Komogentic.Server.OAuth;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.Options;
@@ -44,6 +46,25 @@ builder.Services.AddSingleton(sp =>
     sp.GetRequiredService<IMongoClient>().GetDatabase(sp.GetRequiredService<IOptions<KomogenticOptions>>().Value.Mongo.Database));
 builder.Services.AddSingleton(TimeProvider.System);
 
+// The dashboard: sessions holding the sign-in's Komodo JWT, and the Komodo keys waiting for one to be deleted with.
+builder.Services.AddSingleton<Sessions>();
+builder.Services.AddSingleton<PendingDeletions>();
+builder.Services.AddSingleton<SignInLimiter>();
+
+// The REST API's JSON: a required field that is missing or null is a bad request, not a null in a handler. And a
+// body that can't be bound throws, so ApiErrors answers it as {"error": ...} like every other refusal.
+builder.Services.ConfigureHttpJsonOptions(o =>
+{
+    o.SerializerOptions.RespectNullableAnnotations = true;
+    o.SerializerOptions.RespectRequiredConstructorParameters = true;
+});
+builder.Services.Configure<RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
+
+// Per request: CallerMiddleware resolves the caller, and with it how Komodo calls authenticate. Scoped, and nothing
+// singleton may depend on it.
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped(RequestCaller.Current);
+
 // The OAuth authorisation server: connections, clients (metadata documents and registrations), pending requests.
 builder.Services.AddSingleton<Connections>();
 builder.Services.AddClientMetadataFetcher();
@@ -52,8 +73,9 @@ builder.Services.AddSingleton<AuthorizationRequests>();
 builder.Services.AddSingleton<OAuthLimits>();
 
 var app = builder.Build();
+var options = app.Services.GetRequiredService<IOptions<KomogenticOptions>>().Value;
 
-if (app.Services.GetRequiredService<IOptions<KomogenticOptions>>().Value.Proxy.Trusted)
+if (options.Proxy.Trusted)
 {
     // Traefik reaches the container over a Docker network whose addresses Docker assigns, so no proxy address
     // can be pinned: any peer is trusted, safe only while the proxy is the only way in from outside the host (no
@@ -67,11 +89,39 @@ if (app.Services.GetRequiredService<IOptions<KomogenticOptions>>().Value.Proxy.T
     app.UseForwardedHeaders(forwarded);
 }
 
+var publicUrl = options.PublicUrl is { Length: > 0 } url ? url : null;
+app.UseSecurityHeaders(publicUrl);
+app.Use(ApiErrors.BadRequestsAsync);
+
+// The web app (web/, built into wwwroot): index.html changes with every build and must be revalidated, the
+// hashed files under /assets never change. Before routing: static files need no caller.
+var webApp = new StaticFileOptions
+{
+    OnPrepareResponse = context => context.Context.Response.Headers.CacheControl =
+        context.Context.Request.Path.StartsWithSegments("/assets") ? "public, max-age=31536000, immutable" : "no-cache",
+};
+app.UseDefaultFiles();
+app.UseStaticFiles(webApp);
+
+// Routing first, so that CallerMiddleware sees the endpoint and its AllowAnonymous.
+app.UseRouting();
 app.UseOAuthCors();
+app.UseMiddleware<CallerMiddleware>();
+app.UseCallerRules(publicUrl);
 
 app.MapGet("/healthz", () => "ok").AllowAnonymous().ExcludeFromDescription();
 app.MapDiscovery();
 app.MapOAuthEndpoints();
+app.MapSessionApi();
+
+// An unknown /api or /mcp path is a JSON 404, never the web app. These are the more specific fallbacks, so they
+// win over the web app's; and they are not anonymous: CallerMiddleware still asks for a caller first.
+app.MapFallback("/api/{**path}", () => Results.Json(new ApiError("Not found."), statusCode: StatusCodes.Status404NotFound));
+app.MapFallback("/mcp/{**path}", () => Results.Json(new ApiError("Not found."), statusCode: StatusCodes.Status404NotFound));
+// A missing build file (an old chunk after a redeploy) is a plain 404: the shell in its place would fail as a script.
+app.MapFallback("/assets/{**path}", () => Results.NotFound()).AllowAnonymous();
+// Every other path is the web app's router's: index.html, without signing in (the app itself asks for that).
+app.MapFallbackToFile("{**path}", "index.html", webApp).AllowAnonymous();
 
 app.Run();
 

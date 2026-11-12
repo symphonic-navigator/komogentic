@@ -125,6 +125,7 @@ public sealed class FakeKomodo : IAsyncDisposable
     private readonly ConcurrentDictionary<string, TimeSpan> _delays = [];
     private readonly List<FakeRequest> _requests = [];
     private readonly List<string> _violations = [];
+    private readonly List<string> _jwts = [];
     private readonly WebApplication _app;
 
     private FakeKomodo(WebApplication app)
@@ -167,6 +168,9 @@ public sealed class FakeKomodo : IAsyncDisposable
     public IReadOnlyList<string> Violations { get { lock (_gate) return [.. _violations]; } }
 
     public IReadOnlyList<FakeApiKey> ApiKeys { get { lock (_gate) return [.. _keys.Values]; } }
+
+    /// <summary>Every JWT the fake issued, oldest first: for tests that check where one must not show up.</summary>
+    public IReadOnlyList<string> IssuedJwts { get { lock (_gate) return [.. _jwts]; } }
 
     public HttpClient CreateHttpClient(TimeSpan? timeout = null) =>
         new(new SocketsHttpHandler { AllowAutoRedirect = false, UseCookies = false, UseProxy = false })
@@ -226,7 +230,9 @@ public sealed class FakeKomodo : IAsyncDisposable
         var header = B64(Encoding.UTF8.GetBytes("""{"alg":"HS256","typ":"JWT"}"""));
         var payload = B64(JsonSerializer.SerializeToUtf8Bytes(new { sub = userId, iat, exp }));
         var signature = B64(HMACSHA256.HashData(_jwtKey, Encoding.ASCII.GetBytes(header + "." + payload)));
-        return $"{header}.{payload}.{signature}";
+        var jwt = $"{header}.{payload}.{signature}";
+        lock (_gate) _jwts.Add(jwt);
+        return jwt;
     }
 
     public FakeApiKey IssueKey(string userId, string name, long expires = 0)

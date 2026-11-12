@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Komogentic.Server.Accounts;
+using Komogentic.Server.Api;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Options;
 
@@ -172,7 +172,7 @@ public static partial class OAuthEndpoints
         http.Response.Headers.CacheControl = "no-store";
         if (limits.Registration(http) is { } retryAfter)
         {
-            SetRetryAfter(http, retryAfter);
+            ApiErrors.SetRetryAfter(http, retryAfter);
             return Error(StatusCodes.Status429TooManyRequests, "invalid_client_metadata", "Too many registrations from this network; try again later.");
         }
 
@@ -229,10 +229,6 @@ public static partial class OAuthEndpoints
 
         return buffer.ToArray();
     }
-
-    /// <summary>Whole seconds, at least one.</summary>
-    internal static void SetRetryAfter(HttpContext http, TimeSpan retryAfter) =>
-        http.Response.Headers.RetryAfter = ((int)Math.Ceiling(Math.Max(1, retryAfter.TotalSeconds))).ToString(CultureInfo.InvariantCulture);
 
     // RFC 7591 §3.2.2 / RFC 6749 §5.2: {"error", "error_description"}.
     private static IResult Error(int status, string error, string description) =>
