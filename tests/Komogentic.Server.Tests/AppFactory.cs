@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+using Komogentic.Server.Tests.Komodo;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using MongoDB.Driver;
@@ -7,7 +8,8 @@ using Testcontainers.MongoDb;
 namespace Komogentic.Server.Tests;
 
 /// <summary>
-/// The real server in memory: Program.cs wiring and a MongoDB container (or the server in <c>KOMOGENTIC_TEST_MONGO</c>).
+/// The real server in memory: Program.cs wiring, a MongoDB container (or the server in <c>KOMOGENTIC_TEST_MONGO</c>)
+/// and a fake Komodo Core.
 /// </summary>
 public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
@@ -20,8 +22,11 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
     /// <summary>The app's database, for tests that look behind the server's back.</summary>
     public IMongoDatabase Database => new MongoClient(MongoConnectionString).GetDatabase(DatabaseName);
 
+    public FakeKomodo Komodo { get; private set; } = null!;
+
     public async ValueTask InitializeAsync()
     {
+        Komodo = await FakeKomodo.StartAsync();
         if (_mongo is not null)
         {
             await _mongo.StartAsync();
@@ -35,6 +40,7 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
     public override async ValueTask DisposeAsync()
     {
         await base.DisposeAsync();
+        await Komodo.DisposeAsync();
         if (_mongo is not null)
         {
             await _mongo.DisposeAsync();
@@ -45,7 +51,7 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
     {
         builder.UseSetting("Komogentic:Mongo:ConnectionString", MongoConnectionString);
         builder.UseSetting("Komogentic:Mongo:Database", DatabaseName);
-        builder.UseSetting("Komogentic:Komodo:Url", "http://komodo.invalid");
+        builder.UseSetting("Komogentic:Komodo:Url", Komodo.Url.ToString());
     }
 }
 

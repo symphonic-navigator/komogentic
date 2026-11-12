@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="Komodo/komodo-2.3.4-requests.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../../src/Komogentic.Server/Komogentic.Server.csproj" />
   </ItemGroup>
 
