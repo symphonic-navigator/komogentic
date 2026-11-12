@@ -36,6 +36,24 @@ public sealed class OptionsTests(AppFactory app)
         Assert.Contains("PublicUrl", Unwrap(e).Message);
     }
 
+    [Fact]
+    public void Loopback_clients_are_refused_in_production()
+    {
+        using var broken = app.WithWebHostBuilder(b => b.UseEnvironment("Production").UseSetting("Komogentic:OAuth:AllowLoopbackClients", "true"));
+
+        var e = Assert.ThrowsAny<Exception>(() => broken.CreateClient());
+        Assert.Contains("AllowLoopbackClients", Unwrap(e).Message);
+    }
+
+    [Fact]
+    public void Trusted_proxy_needs_a_public_url()
+    {
+        using var broken = app.WithWebHostBuilder(b => b.UseSetting("Komogentic:Proxy:Trusted", "true").UseSetting("Komogentic:PublicUrl", ""));
+
+        var e = Assert.ThrowsAny<Exception>(() => broken.CreateClient());
+        Assert.Contains("Proxy:Trusted", Unwrap(e).Message);
+    }
+
     private static Exception Unwrap(Exception e)
     {
         for (var inner = e; inner is not null; inner = inner.InnerException)

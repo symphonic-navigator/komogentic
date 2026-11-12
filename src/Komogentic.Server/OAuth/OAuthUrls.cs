@@ -38,7 +38,7 @@ public static partial class OAuthUrls
     public static string ResourceMetadata(string origin, string connectionId, bool trailingSlash = false) =>
         $"{origin}{ResourceMetadataPrefix}{ConnectionPrefix}{connectionId}{(trailingSlash ? "/" : "")}";
 
-    /// <summary>scheme and host lower-cased, a default port dropped, one trailing slash dropped; the path
+    /// <summary>Scheme and host lower-cased, a default port dropped, one trailing slash dropped; the path
     /// (and query, which no resource has) is kept as is, so it compares ordinally. Not a URL: returned unchanged.</summary>
     public static string Canonical(string url)
     {

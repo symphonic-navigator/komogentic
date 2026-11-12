@@ -6,8 +6,8 @@ using MongoDB.Driver;
 namespace Komogentic.Server.OAuth;
 
 /// <summary>
-/// An authorisation request that passed <c>/oauth/authorize</c>, waiting for the user's decision on the consent page
-///. Everything here came from the app's request, checked: the client resolved, the redirect URI one of
+/// An authorisation request that passed <c>/oauth/authorize</c>, waiting for the user's decision on the consent page.
+/// Everything here came from the app's request, checked: the client resolved, the redirect URI one of
 /// its own, PKCE S256. <see cref="ConnectionId"/> is the connection <see cref="Resource"/> names, or null with
 /// <see cref="Problem"/> <c>"not_a_connection"</c>. <see cref="ReadOnly"/>: the scopes asked for
 /// <c>komodo:read</c> and not <c>komodo:operate</c>, which limits the grant to the read tools.

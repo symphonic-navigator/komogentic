@@ -169,7 +169,7 @@ public sealed class OAuthClients(IMongoDatabase db, ClientMetadataFetcher fetche
         _ready = true;
     }
 
-    /// <summary>exact, except an http loopback redirect whose port is ignored (RFC 8252 §7.3).</summary>
+    /// <summary>Exact, except an http loopback redirect whose port is ignored (RFC 8252 §7.3).</summary>
     public static bool RedirectMatches(OAuthClient client, string redirectUri)
     {
         if (client.RedirectUris.Contains(redirectUri, StringComparer.Ordinal)) return true;

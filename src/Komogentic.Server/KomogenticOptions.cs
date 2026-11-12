@@ -49,7 +49,7 @@ public sealed class KomogenticOptions
 }
 
 /// <summary>Refuses to start with a configuration that can't work, naming the setting.</summary>
-public sealed class KomogenticOptionsValidator : IValidateOptions<KomogenticOptions>
+public sealed class KomogenticOptionsValidator(IHostEnvironment environment) : IValidateOptions<KomogenticOptions>
 {
     public ValidateOptionsResult Validate(string? name, KomogenticOptions options)
     {
@@ -65,6 +65,11 @@ public sealed class KomogenticOptionsValidator : IValidateOptions<KomogenticOpti
         if (options.PublicUrl is { Length: > 0 } publicUrl
             && (!Uri.TryCreate(publicUrl, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https") || url.AbsolutePath != "/" || url.Query != "" || url.Fragment != ""))
             failures.Add("Komogentic:PublicUrl must be scheme, host and port only, without a path (KOMOGENTIC_PUBLIC_URL).");
+        if (options.OAuth.AllowLoopbackClients && environment.IsProduction())
+            failures.Add("Komogentic:OAuth:AllowLoopbackClients is for tests and development only: it lets client metadata documents come from this machine's own addresses, so it is refused in Production.");
+        // Without a public URL the issuer and the connection URLs would come from the Host header, which a client picks.
+        if (options.Proxy.Trusted && string.IsNullOrEmpty(options.PublicUrl))
+            failures.Add("Komogentic:Proxy:Trusted (KOMOGENTIC_TRUSTED_PROXY) needs Komogentic:PublicUrl (KOMOGENTIC_PUBLIC_URL).");
         return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
     }
 }

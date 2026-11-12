@@ -5,9 +5,9 @@ using Komogentic.Server.Auth;
 namespace Komogentic.Server.OAuth;
 
 /// <summary>
-/// The OAuth endpoints' rate limits, in memory like <see cref="WrongKeyLimiter"/>: registrations per
-/// network, metadata document fetches per address and per host, failed token requests per client id and network together. Not per client id alone: anyone can name
-/// claude.ai's client id, and 20 bogus requests would then stop every real claude.ai exchange for a minute. Not per
+/// The OAuth endpoints' rate limits, in memory like <see cref="WrongKeyLimiter"/>: registrations per network,
+/// metadata document fetches per address and per host, failed token requests per client id and network together.
+/// Not per client id alone: anyone can name claude.ai's client id, and 20 bogus requests would then stop every real claude.ai exchange for a minute. Not per
 /// network alone either: Anthropic's connectors all come from one egress range, so its users would share
 /// one budget with every other client calling from there.
 /// </summary>

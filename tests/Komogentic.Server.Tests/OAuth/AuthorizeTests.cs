@@ -442,6 +442,23 @@ public sealed class AuthorizeTests(AppFactory app)
     }
 
     [Fact]
+    public async Task A_metadata_document_fetch_logs_no_url()
+    {
+        await using var server = await MetadataServer.StartAsync(new MetadataResponse());
+        server.Response = () => new MetadataResponse(
+            $$"""{"client_id":"{{server.ClientId}}","client_name":"Claude","redirect_uris":["{{Callback}}"],"token_endpoint_auth_method":"none"}""");
+        var log = new CapturedLog();
+        var api = Api.WithWebHostBuilder(b => b.UseSetting("Komogentic:OAuth:AllowLoopbackClients", "true").ConfigureLogging(l => l.AddProvider(log)));
+        var flow = (await FlowAsync(api: api)) with { ClientId = server.ClientId };
+
+        using var response = await AuthorizeAsync(api, flow.Parameters());
+
+        Assert.Equal(1, server.Requests);
+        // The client id is a stranger's URL; only its host is logged (LogStep).
+        Assert.DoesNotContain(log.Lines, l => l.Contains(new Uri(server.ClientId).AbsolutePath, StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Authorize_needs_no_cookie()
     {
         var flow = await FlowAsync();

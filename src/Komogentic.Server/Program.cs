@@ -12,6 +12,9 @@ var builder = WebApplication.CreateBuilder(args);
 // ASP.NET logs every request line at Information ("Request starting GET /oauth/authorize?..."): nothing an operator
 // needs, and a URL may carry something secret (an authorisation's state and challenge). Warnings and errors stay.
 builder.Logging.AddFilter("Microsoft.AspNetCore", LogLevel.Warning);
+// HttpClientFactory logs every outgoing request's URL: a client metadata document's is a stranger's to choose, and
+// Komodo's would say who called what when. Failures are logged where they are handled.
+builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.Warning);
 
 builder.Services.AddOptions<KomogenticOptions>()
     .Bind(builder.Configuration.GetSection("Komogentic"))
