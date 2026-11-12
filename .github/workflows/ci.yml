@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      KOMOGENTIC_TEST_MONGO: mongodb://127.0.0.1:27017/?replicaSet=rs0&directConnection=true
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: global.json
+      # A service container can't be given --replSet, so MongoDB runs from a step, as a single-node replica set (the
+      # server's transactions need one), initiated as the tests' TestImages does it.
+      - name: Start MongoDB
+        run: |
+          docker run -d --name mongo -p 127.0.0.1:27017:27017 mongo:8 --replSet rs0 --bind_ip_all
+          for i in $(seq 60); do
+            docker exec mongo mongosh --quiet --eval 'try { rs.status().ok } catch (e) { rs.initiate({_id: "rs0", members: [{_id: 0, host: "127.0.0.1:27017"}]}).ok }' 2>/dev/null | grep -q 1 && break
+            sleep 1
+          done
+          for i in $(seq 60); do
+            docker exec mongo mongosh --quiet --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true && exit 0
+            sleep 1
+          done
+          docker logs mongo
+          exit 1
+      # Locked: a project whose packages differ from its packages.lock.json fails here.
+      - run: dotnet restore --locked-mode
+      - run: dotnet build --configuration Release --no-restore
+      - run: dotnet test --solution Komogentic.slnx --configuration Release --no-build
+
+  web:
+    name: Web app
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26
+      # pnpm at the version web/package.json's packageManager names, as the image build takes it.
+      - run: npm install -g pnpm@10.32.1
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm build
