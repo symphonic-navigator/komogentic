@@ -57,6 +57,10 @@ public sealed class RequestCaller
     public static RequestCaller ForSession(KomodoUser user, string jwt, DateTime expiresAt) =>
         new(CallerKind.Session, user, new KomodoAuth.Jwt(jwt), null, null, null, false, expiresAt);
 
+    /// <summary>An agent with an API key that <see cref="ApiKeys.ResolveAsync"/> found active: Komodo as the key's own Komodo key.</summary>
+    public static RequestCaller ForApiKey(ResolvedApiKey key) =>
+        new(CallerKind.ApiKey, key.User, key.Komodo, key.Id, key.Name, null, false, key.ExpiresAt);
+
     /// <summary>The caller of the current request. Fails closed: a service asking on a request without a
     /// caller (an anonymous endpoint) is a bug, never a reason to fall back to some default.</summary>
     internal static RequestCaller Current(IServiceProvider services) =>

@@ -7,6 +7,8 @@ using Komogentic.Server.Komodo;
 using Komogentic.Server.OAuth;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.Options;
+using ModelContextProtocol.Protocol;
+using ModelContextProtocol.Server;
 using MongoDB.Driver;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -29,6 +31,7 @@ builder.Services.AddHttpClient<KomodoClient>((services, http) =>
         // A trailing slash keeps a path prefix in front of /read, /execute and /auth.
         http.BaseAddress = new Uri(komodo.Url.EndsWith('/') ? komodo.Url : komodo.Url + "/");
         http.Timeout = TimeSpan.FromSeconds(komodo.TimeoutSeconds);
+        http.MaxResponseContentBufferSize = KomodoClient.MaxAnswerBytes;
     })
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
@@ -51,6 +54,10 @@ builder.Services.AddSingleton<Sessions>();
 builder.Services.AddSingleton<PendingDeletions>();
 builder.Services.AddSingleton<SignInLimiter>();
 
+// API keys for local agents, on plain /mcp; wrong ones are counted per address.
+builder.Services.AddSingleton<ApiKeys>();
+builder.Services.AddSingleton<WrongKeyLimiter>();
+
 // The REST API's JSON: a required field that is missing or null is a bad request, not a null in a handler. And a
 // body that can't be bound throws, so ApiErrors answers it as {"error": ...} like every other refusal.
 builder.Services.ConfigureHttpJsonOptions(o =>
@@ -71,6 +78,15 @@ builder.Services.AddClientMetadataFetcher();
 builder.Services.AddSingleton<OAuthClients>();
 builder.Services.AddSingleton<AuthorizationRequests>();
 builder.Services.AddSingleton<OAuthLimits>();
+
+// MCP over Streamable HTTP, stateless (the SDK's default): no Mcp-Session-Id, nothing kept between requests. The
+// tools come with Task 6; until then an empty collection, so that tools/list answers an empty list.
+builder.Services.AddMcpServer(o =>
+    {
+        o.ServerInfo = new Implementation { Name = "komogentic", Version = BuildVersion.Semver };
+        o.ToolCollection = [];
+    })
+    .WithHttpTransport();
 
 var app = builder.Build();
 var options = app.Services.GetRequiredService<IOptions<KomogenticOptions>>().Value;
@@ -113,6 +129,8 @@ app.MapGet("/healthz", () => "ok").AllowAnonymous().ExcludeFromDescription();
 app.MapDiscovery();
 app.MapOAuthEndpoints();
 app.MapSessionApi();
+app.MapKeyApi();
+app.MapMcp("/mcp");
 
 // An unknown /api or /mcp path is a JSON 404, never the web app. These are the more specific fallbacks, so they
 // win over the web app's; and they are not anonymous: CallerMiddleware still asks for a caller first.

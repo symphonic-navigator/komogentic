@@ -56,11 +56,16 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
     public override async ValueTask DisposeAsync()
     {
         await base.DisposeAsync();
+        var violations = Komodo.Violations;
         await Komodo.DisposeAsync();
         if (_mongo is not null)
         {
             await _mongo.DisposeAsync();
         }
+
+        // Last, so that everything is cleaned up first; a fixture's cleanup failure fails the run.
+        if (violations.Count > 0)
+            throw new InvalidOperationException("The fake Core saw calls outside the closed list: " + string.Join(", ", violations));
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)

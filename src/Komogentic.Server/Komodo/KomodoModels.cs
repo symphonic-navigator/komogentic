@@ -6,7 +6,9 @@ namespace Komogentic.Server.Komodo;
 
 // Komodo's answers as far as Komogentic reads them; read with snake_case names (KomodoClient.Json). Paths are in
 // Komodo 2.3.4 (client/core/rs/src/…) or the mogh auth crates. States stay strings, as Komodo spells them:
-// StackState snake_case, StackServiceState PascalCase, a container's state lowercase.
+// StackState snake_case, StackServiceState PascalCase, a container's state lowercase. Nullable exactly where Komodo's
+// field is an Option; a default only where Komodo leaves the field out (skip_serializing_if), as every other one is
+// required (KomodoClient.Json).
 
 /// <summary>mogh_auth_client 1.7.0 <c>api/login.rs</c> <c>JwtOrTwoFactor</c>, reduced: TOTP and passkey are both "two factor".</summary>
 public sealed record LoginResult(string? Jwt, bool TwoFactor)
@@ -49,8 +51,9 @@ public sealed record StackService(
     SwarmServiceListItem? SwarmService,
     string State);
 
-/// <summary><c>entities/docker/container.rs</c> <c>ContainerListItem</c>; <c>State</c> lowercase, health only inside <c>Status</c> ("Up 5 minutes (healthy)").</summary>
-public sealed record ContainerListItem(string Name, string State, string? Status);
+/// <summary><c>entities/docker/container.rs</c> <c>ContainerListItem</c>; <c>State</c> lowercase, health only inside <c>Status</c>
+/// ("Up 5 minutes (healthy)"), which Komodo leaves out when it has none.</summary>
+public sealed record ContainerListItem(string Name, string State, string? Status = null);
 
 /// <summary><c>entities/docker/service.rs</c> <c>SwarmServiceListItem</c>, whose fields are PascalCase.</summary>
 public sealed record SwarmServiceListItem(

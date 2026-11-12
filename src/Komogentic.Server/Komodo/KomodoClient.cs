@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Komogentic.Server.Komodo;
 
@@ -26,12 +27,28 @@ public abstract record KomodoAuth
 /// Komodo Core's API, limited to the calls of <see cref="KomodoCall"/>. Every request goes through
 /// <see cref="SendAsync"/>, the only member that builds one (ClosedListTests checks this).
 /// </summary>
-public sealed class KomodoClient(HttpClient http)
+public sealed partial class KomodoClient(HttpClient http)
 {
+    /// <summary>The most of an answer Komogentic reads (Program.cs); a 5000-line log is far below it.</summary>
+    public const int MaxAnswerBytes = 16 * 1024 * 1024;
+
+    /// <summary>What a 429 of Komodo's auth rate limiter says. Komodo counts failed authentications per address, on
+    /// every route, and sees only Komogentic's: once it is tripped, it refuses everyone's requests, valid ones too.</summary>
+    public const string RateLimitedMessage =
+        "Komodo is refusing requests from Komogentic for a moment after several failed authentications; try again in a minute.";
+
+    /// <summary>A field that is missing or null where Komodo's type has no <c>Option</c> is an answer Komogentic does not
+    /// know, never a null in a caller.</summary>
     internal static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
         PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        RespectNullableAnnotations = true,
+        RespectRequiredConstructorParameters = true,
     };
+
+    /// <summary>The credential errors of Komodo itself (mogh_auth_server 1.8.0 middleware.rs and api/login/local.rs,
+    /// komodo bin/core/src/auth/middleware.rs); with its rate limiter on, " | You have N attempts remaining" follows.</summary>
+    private static readonly string[] CredentialErrors = ["Invalid user credentials", "Invalid login credentials", "Invalid client credentials"];
 
     public async Task<LoginResult> LoginLocalUserAsync(string username, string password, CancellationToken ct)
     {
@@ -45,36 +62,37 @@ public sealed class KomodoClient(HttpClient http)
     }
 
     /// <summary><paramref name="expiresAt"/> null for a key without expiry (<c>expires: 0</c>).</summary>
-    public async Task<CreatedKey> CreateApiKeyAsync(KomodoAuth.Jwt auth, string name, DateTime? expiresAt, CancellationToken ct)
+    public async Task<CreatedKey> CreateApiKeyAsync(KomodoAuth.Jwt auth, string name, DateTimeOffset? expiresAt, CancellationToken ct)
     {
-        var expires = expiresAt is { } at ? new DateTimeOffset(at.ToUniversalTime()).ToUnixTimeMilliseconds() : 0;
+        var expires = expiresAt?.ToUnixTimeMilliseconds() ?? 0;
         var answer = await SendAsync(KomodoCall.CreateApiKey, auth, new { name, expires }, ct);
         return Read<CreatedKey>(KomodoCall.CreateApiKey.Name, answer);
     }
 
-    /// <summary>A key Komodo no longer has counts as deleted.</summary>
+    /// <summary>A key Komodo no longer has counts as deleted; any other 404 (a proxy's, say) does not.</summary>
     public async Task DeleteApiKeyAsync(KomodoAuth.Jwt auth, string key, CancellationToken ct)
     {
         try
         {
             await SendAsync(KomodoCall.DeleteApiKey, auth, new { key }, ct);
         }
-        catch (KomodoException e) when (e.Status == 404)
+        catch (KomodoException e) when (e.Status == 404 && e.KomodoError.StartsWith("No api key with key found", StringComparison.Ordinal))
         {
-            // "No api key with key found" (komodo bin/core/src/auth/mod.rs, get_api_key_user_id).
+            // komodo bin/core/src/auth/mod.rs, get_api_key_user_id.
         }
     }
 
-    /// <summary>Every stack the user may read. Without <c>limit: 0</c> Komodo returns one page of <c>default_pagination_limit</c> (30).</summary>
+    /// <summary>Every stack the user may read, templates aside. Without <c>limit: 0</c> Komodo returns one page of
+    /// <c>default_pagination_limit</c> (30).</summary>
     public async Task<IReadOnlyList<StackListItem>> ListStacksAsync(KomodoAuth auth, CancellationToken ct)
     {
-        var answer = await SendAsync(KomodoCall.ListStacks, auth, new { query = new { }, limit = 0 }, ct);
+        var answer = await SendAsync(KomodoCall.ListStacks, auth, new { query = new { templates = ExcludeTemplates }, limit = 0 }, ct);
         return Read<List<StackListItem>>(KomodoCall.ListStacks.Name, answer);
     }
 
     public async Task<StackListItem?> FindStackAsync(KomodoAuth auth, string name, CancellationToken ct)
     {
-        var answer = await SendAsync(KomodoCall.ListStacks, auth, new { query = new { names = new[] { name } } }, ct);
+        var answer = await SendAsync(KomodoCall.ListStacks, auth, new { query = new { names = new[] { name }, templates = ExcludeTemplates } }, ct);
         return Read<List<StackListItem>>(KomodoCall.ListStacks.Name, answer).FirstOrDefault(s => s.Name == name);
     }
 
@@ -117,8 +135,11 @@ public sealed class KomodoClient(HttpClient http)
         return Read<UpdateListPage>(KomodoCall.ListUpdates.Name, answer).Updates;
     }
 
+    /// <summary>An id that isn't an ObjectId's hex is refused without asking Komodo: it would only fail there.</summary>
     public async Task<Update> GetUpdateAsync(KomodoAuth auth, string id, CancellationToken ct)
     {
+        if (!UpdateId().IsMatch(id))
+            throw new KomodoException(KomodoErrorKind.NotFoundOrForbidden, 0, $"{KomodoCall.GetUpdate.Name}: no update exists with given id");
         var answer = await SendAsync(KomodoCall.GetUpdate, auth, new { id }, ct);
         return Read<Update>(KomodoCall.GetUpdate.Name, answer);
     }
@@ -169,6 +190,11 @@ public sealed class KomodoClient(HttpClient http)
         {
             throw;
         }
+        catch (HttpRequestException e) when (e.HttpRequestError == HttpRequestError.ConfigurationLimitExceeded)
+        {
+            // MaxResponseContentBufferSize: Komodo answered, with more than Komogentic reads.
+            throw new KomodoException(KomodoErrorKind.Failed, 0, $"Komodo's answer to {call.Name} is larger than Komogentic reads.");
+        }
         catch (Exception e) when (e is HttpRequestException or OperationCanceledException or IOException)
         {
             // HttpClient.Timeout surfaces as a TaskCanceledException that the caller's token did not cause.
@@ -179,6 +205,15 @@ public sealed class KomodoClient(HttpClient http)
             return Parse(call.Name, answer, a => a);
         throw Classify(call.Name, status, answer);
     }
+
+    /// <summary><c>entities/resource.rs</c> <c>TemplatesQueryBehavior::Exclude</c>, serialised by serde as its name.</summary>
+    private const string ExcludeTemplates = "Exclude";
+
+    [GeneratedRegex("^[0-9a-f]{24}$")]
+    private static partial Regex UpdateId();
+
+    [GeneratedRegex(@"Try again in [0-9][0-9.]{0,9}[a-zµ]{1,2}")]
+    private static partial Regex TryAgainIn();
 
     private static KomodoException Classify(string call, int status, byte[] answer)
     {
@@ -207,23 +242,33 @@ public sealed class KomodoClient(HttpClient http)
         if (text.Length > 2000) text = text[..2000] + "…";
         var both = error + "\n" + trace;
 
+        KomodoErrorKind kind;
         if (status == 429)
-            return new KomodoException(KomodoErrorKind.RateLimited, status,
-                "Komodo is refusing sign-ins for a moment after several failures; try again in a minute.");
-        if (status == 401
-            // A JWT that is expired or not Komodo's is a plain anyhow error in mogh_auth_server's middleware.rs: 500.
-            || error.StartsWith("Invalid user credentials", StringComparison.Ordinal))
-            return new KomodoException(KomodoErrorKind.Unauthorized, status, text);
-        if (status is 502 or 503 or 504)
-            return new KomodoException(KomodoErrorKind.Unreachable, status, "Komodo could not be reached");
-        if (status is 403 or 404
+        {
+            // mogh_rate_limit 1.0.1: "Too many attempts | Try again in 14s".
+            var message = TryAgainIn().Match(error) is { Success: true } wait ? $"{RateLimitedMessage} (Komodo: {wait.Value}.)" : RateLimitedMessage;
+            return new KomodoException(KomodoErrorKind.RateLimited, status, message) { KomodoError = error };
+        }
+
+        // Only Komodo's own word: a 401 without it is from something in front of Komodo. A JWT that is expired or not
+        // Komodo's is a plain anyhow error in mogh_auth_server's middleware.rs, so 500.
+        if (status is 401 or 500 && CredentialErrors.Any(e => error.StartsWith(e, StringComparison.Ordinal)))
+            kind = KomodoErrorKind.Unauthorized;
+        else if (status is 502 or 503 or 504)
+            return new KomodoException(KomodoErrorKind.Unreachable, status, "Komodo could not be reached") { KomodoError = error };
+        else if (status is 403 or 404
             || both.Contains("Did not find any Stack matching", StringComparison.Ordinal)
             || both.Contains("does not have required permissions", StringComparison.Ordinal)
-            || both.Contains("no update exists with given id", StringComparison.Ordinal))
-            return new KomodoException(KomodoErrorKind.NotFoundOrForbidden, status, text);
-        if (status is 400 or 415 or 422)
-            return new KomodoException(KomodoErrorKind.BadRequest, status, text);
-        return new KomodoException(KomodoErrorKind.Failed, status, text);
+            // komodo bin/core/src/api/read/update.rs GetUpdate and permission.rs check_user_target_access.
+            || (call == KomodoCall.GetUpdate.Name
+                && (both.Contains("no update exists", StringComparison.OrdinalIgnoreCase)
+                    || both.Contains("user must be admin to view system updates", StringComparison.Ordinal))))
+            kind = KomodoErrorKind.NotFoundOrForbidden;
+        else if (status is 400 or 415 or 422)
+            kind = KomodoErrorKind.BadRequest;
+        else
+            kind = KomodoErrorKind.Failed;
+        return new KomodoException(kind, status, text) { KomodoError = error };
     }
 
     private static T Read<T>(string call, JsonElement answer) =>
@@ -255,5 +300,5 @@ public sealed class KomodoClient(HttpClient http)
     }
 
     private static KomodoException Unexpected(string call) =>
-        new(KomodoErrorKind.Failed, 200, $"Komodo answered {call} in a shape Komogentic does not know (is it Komodo 2.3?).");
+        new(KomodoErrorKind.Failed, 200, $"Komodo answered in a shape Komogentic does not know ({call}).");
 }

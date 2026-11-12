@@ -30,4 +30,7 @@ public sealed class KomodoException(KomodoErrorKind kind, int status, string mes
 
     /// <summary>Komodo's HTTP status; 0 when there was no answer.</summary>
     public int Status { get; } = status;
+
+    /// <summary>The <c>error</c> of Komodo's answer (mogh_error's <c>{error, trace}</c>), empty without one.</summary>
+    internal string KomodoError { get; init; } = "";
 }

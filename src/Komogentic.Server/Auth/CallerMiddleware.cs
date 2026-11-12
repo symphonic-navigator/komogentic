@@ -18,12 +18,14 @@ namespace Komogentic.Server.Auth;
 /// anonymous endpoint is mapped there itself: an anonymous fallback (the web app's) doesn't count. Runs after routing
 /// and before any endpoint; never logs a key, a token or a cookie.
 /// </summary>
-public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions)
+public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, ApiKeys apiKeys, WrongKeyLimiter wrongKeys)
 {
     public const string SessionCookie = "kgt_session";
 
     /// <summary>What <c>/api</c> answers, with a 401, a request without a session: also a session ended meanwhile.</summary>
     internal const string SignInSentence = "Sign in with your Komodo username and password.";
+
+    private const string BearerScheme = "Bearer ";
 
     private static readonly string[] GuardedPrefixes = ["mcp", "api"];
 
@@ -35,9 +37,19 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions)
             return;
         }
 
-        var caller = IsUnder(context, "/api") ? await SessionCallerAsync(context)
-            : ConnectionIdSegment(context) is { } id ? await ConnectionCallerAsync(context, id)
-            : await ApiKeyCallerAsync(context);
+        RequestCaller? caller;
+        if (IsUnder(context, "/api")) caller = await SessionCallerAsync(context);
+        else if (ConnectionIdSegment(context) is { } id) caller = await ConnectionCallerAsync(context, id);
+        else
+        {
+            (caller, var retryAfter) = await ApiKeyCallerAsync(context);
+            if (retryAfter is { } wait)
+            {
+                await TooManyAsync(context, wait);
+                return;
+            }
+        }
+
         if (caller is null)
         {
             await UnauthorisedAsync(context);
@@ -59,8 +71,40 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions)
             ? RequestCaller.ForSession(session.User, session.Jwt, session.ExpiresAt)
             : null;
 
-    /// <summary>Plain <c>/mcp</c>: an API key (Task 5). Until then nothing opens it.</summary>
-    private static Task<RequestCaller?> ApiKeyCallerAsync(HttpContext context) => Task.FromResult<RequestCaller?>(null);
+    /// <summary>
+    /// Plain <c>/mcp</c>: an API key as <c>Authorization: Bearer kgt_…</c>, nothing else (no cookie: see
+    /// <see cref="SessionCallerAsync"/>). Every bearer is checked under the <see cref="WrongKeyLimiter"/>, and one that
+    /// doesn't open uses up a permit, so that keys can't be guessed; with the permits used up, every bearer from that
+    /// address is refused (the wait is answered). A revoked, expired or dead key is refused here, before any Komodo call.
+    /// </summary>
+    private async Task<(RequestCaller? Caller, TimeSpan? RetryAfter)> ApiKeyCallerAsync(HttpContext context)
+    {
+        var header = context.Request.Headers.Authorization.ToString();
+        if (!header.StartsWith(BearerScheme, StringComparison.OrdinalIgnoreCase)) return (null, null);
+
+        var ip = WrongKeyLimiter.Partition(context.Connection.RemoteIpAddress);
+        if (wrongKeys.TryReserve(ip) is { } retryAfter) return (null, retryAfter);
+        ResolvedApiKey? key;
+        try
+        {
+            key = await apiKeys.ResolveAsync(header[BearerScheme.Length..].Trim(), context.RequestAborted);
+        }
+        catch
+        {
+            // MongoDB unreachable or the request aborted: not a wrong key.
+            wrongKeys.Release(ip);
+            throw;
+        }
+
+        if (key is null)
+        {
+            wrongKeys.Failed(ip);
+            return (null, null);
+        }
+
+        wrongKeys.Release(ip);
+        return (RequestCaller.ForApiKey(key), null);
+    }
 
     /// <summary>A connection's URL: that connection's access tokens only (Task 8a). Until then nothing opens it, and an
     /// unknown id is a 401 like a known one.</summary>
@@ -103,6 +147,14 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions)
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
         if (IsUnder(context, "/api")) return context.Response.WriteAsJsonAsync(new Api.ApiError(SignInSentence));
         context.Response.Headers.WWWAuthenticate = "Bearer";
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Only <c>/mcp</c> reaches this; MCP clients read the status and <c>Retry-After</c>, not a body.</summary>
+    private static Task TooManyAsync(HttpContext context, TimeSpan retryAfter)
+    {
+        context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+        Api.ApiErrors.SetRetryAfter(context, retryAfter);
         return Task.CompletedTask;
     }
 }

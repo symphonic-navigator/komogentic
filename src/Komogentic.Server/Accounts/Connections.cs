@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-using System.Globalization;
 using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json.Serialization;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
@@ -45,15 +43,15 @@ public sealed class Connections(IMongoDatabase db, TimeProvider time)
 {
     internal const string CollectionName = "connections";
 
-    public const int MaxNameLength = 60;
-
-    public static readonly IReadOnlySet<int> ExpiryDays = new HashSet<int> { 30, 90, 365 };
+    public const int MaxNameLength = CredentialRules.MaxNameLength;
 
     /// <summary>RFC 4648 Base32, lower-cased: an id that survives a URL, a host's case folding and being read aloud.</summary>
     private const string Base32 = "abcdefghijklmnopqrstuvwxyz234567";
 
     /// <summary>80 bits, 16 Base32 characters without padding.</summary>
     private const int IdBytes = 10;
+
+    private const string Noun = "A connection";
 
     private volatile bool _ready;
 
@@ -64,21 +62,16 @@ public sealed class Connections(IMongoDatabase db, TimeProvider time)
     /// <summary>
     /// Creates a connection that waits for an app to authorise it. <see cref="ArgumentException"/> for a name that is
     /// empty, longer than <see cref="MaxNameLength"/> or holds control or invisible formatting characters, or an expiry
-    /// other than <see cref="ExpiryDays"/> or never; <see cref="ConnectionNameTakenException"/> if another of the
+    /// other than <see cref="CredentialRules.ExpiryDays"/> or never; <see cref="ConnectionNameTakenException"/> if another of the
     /// user's connections that is neither revoked nor expired has that name (case aside).
     /// </summary>
     public async Task<ConnectionInfo> CreateAsync(KomodoUser user, string name, int? expiresInDays, CancellationToken ct)
     {
-        var clean = name.Normalize(NormalizationForm.FormC).Trim();
-        if (clean.Length is 0 or > MaxNameLength) throw new ArgumentException($"A connection's name has 1 to {MaxNameLength} characters.", nameof(name));
-        // Format characters (zero-width, bidi overrides) are invisible: "claude​" would show as "claude".
-        if (clean.Any(c => char.IsControl(c) || char.GetUnicodeCategory(c) == UnicodeCategory.Format))
-            throw new ArgumentException("A connection's name can't contain control or invisible formatting characters.", nameof(name));
-        if (expiresInDays is { } days && !ExpiryDays.Contains(days))
-            throw new ArgumentException($"A connection expires after {string.Join(", ", ExpiryDays.Order())} days, or never.", nameof(expiresInDays));
+        var clean = CredentialRules.Name(name, Noun);
+        var now = Now;
+        var expiresAt = CredentialRules.ExpiresAt(now, expiresInDays, Noun);
 
         await EnsureReadyAsync(ct);
-        var now = Now;
         // An expired connection's name is free again: it gives up its name key, which the unique index covers.
         await Docs.UpdateManyAsync(
             c => c.User == user.Id && c.NameKey != null && c.ExpiresAt <= now,
@@ -92,9 +85,9 @@ public sealed class Connections(IMongoDatabase db, TimeProvider time)
             Username = user.Username,
             Name = clean,
             NameKey = clean.ToLowerInvariant(),
-            CreatedAt = Milliseconds(now),
+            CreatedAt = CredentialRules.Milliseconds(now),
             // Whole milliseconds, as MongoDB keeps them, so the expiry the tokens get reads back equal.
-            ExpiresAt = expiresInDays is { } d ? Milliseconds(now.AddDays(d)) : null,
+            ExpiresAt = expiresAt,
         };
         try
         {
@@ -134,8 +127,6 @@ public sealed class Connections(IMongoDatabase db, TimeProvider time)
 
         return new string(chars);
     }
-
-    private static DateTime Milliseconds(DateTime t) => new(t.Ticks - (t.Ticks % TimeSpan.TicksPerMillisecond), DateTimeKind.Utc);
 
     /// <summary>Creates the indexes once per process; lazy, so the server starts before MongoDB is reachable.</summary>
     private async Task EnsureReadyAsync(CancellationToken ct)
@@ -217,4 +208,4 @@ public sealed class ConnectionDocument
     public long Wraps { get; set; }
 }
 
-public sealed class ConnectionNameTakenException(string name) : Exception($"You already have a connection named '{name}'.");
+public sealed class ConnectionNameTakenException(string name) : CredentialNameTakenException($"You already have a connection named '{name}'.");

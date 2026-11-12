@@ -99,6 +99,8 @@ public sealed class FakeStack(string id, string name, string serverName, string 
     public string SwarmName { get; set; } = "";
     public string State { get; set; } = state;
     public string? Status { get; set; }
+    /// <summary>A template (Komodo's <c>template: true</c>), which <c>ListStacks</c> leaves out on <c>templates: Exclude</c>.</summary>
+    public bool Template { get; set; }
     public List<FakeService> Services { get; } = [];
     /// <summary>What <c>GetStackLog</c> and <c>SearchStackLog</c> read, one line per log line.</summary>
     public string LogText { get; set; } = "";
@@ -126,6 +128,8 @@ public sealed class FakeKomodo : IAsyncDisposable
     private readonly List<FakeRequest> _requests = [];
     private readonly List<string> _violations = [];
     private readonly List<string> _jwts = [];
+    private readonly Dictionary<string, List<DateTimeOffset>> _generalFailures = [];
+    private readonly Dictionary<string, List<DateTimeOffset>> _loginFailures = [];
     private readonly WebApplication _app;
 
     private FakeKomodo(WebApplication app)
@@ -159,6 +163,16 @@ public sealed class FakeKomodo : IAsyncDisposable
     /// <summary>Every request is answered 429, as Komodo's auth rate limiter does after too many failures.</summary>
     public bool RateLimited { get; set; }
 
+    /// <summary>
+    /// Komodo's auth rate limiters (<c>KOMODO_AUTH_RATE_LIMIT_MAX_ATTEMPTS</c>, <c>…_WINDOW_SECONDS</c>; Komodo's
+    /// default is 5 per 15 s); null, the default here, for none. As in mogh_rate_limit 1.0.1, failures are counted per
+    /// client address (here every client is Komogentic's one), and once there are as many as allowed in the window,
+    /// every request from that address is refused with 429 before its credentials are checked, valid ones too. Komodo
+    /// keeps two: <c>GENERAL_RATE_LIMITER</c> for the authenticated routes and <c>LOCAL_LOGIN_RATE_LIMITER</c> for
+    /// <c>LoginLocalUser</c> (komodo bin/core/src/auth/mod.rs).
+    /// </summary>
+    public (int MaxAttempts, TimeSpan Window)? AuthRateLimit { get; set; }
+
     /// <summary>Komodo's <c>default_pagination_limit</c>, applied to <c>ListStacks</c> without a <c>limit</c>.</summary>
     public int DefaultPaginationLimit { get; set; } = 30;
 
@@ -177,6 +191,7 @@ public sealed class FakeKomodo : IAsyncDisposable
         {
             BaseAddress = Url,
             Timeout = timeout ?? TimeSpan.FromSeconds(10),
+            MaxResponseContentBufferSize = KomodoClient.MaxAnswerBytes,
         };
 
     public KomodoClient CreateClient(TimeSpan? timeout = null) => new(CreateHttpClient(timeout));
@@ -361,11 +376,22 @@ public sealed class FakeKomodo : IAsyncDisposable
             if (_failAlways.TryGetValue(type, out var always))
                 return new Answer(always.Status, null) { Raw = always.Body };
 
+            var address = ctx.Connection.RemoteIpAddress?.ToString() ?? "";
             if (type == "LoginLocalUser")
-                return Login(parameters);
+                return Limited(_loginFailures, address, () => Login(parameters));
 
-            var (user, failure) = Authenticate(ctx);
-            if (failure is not null) return failure;
+            // mogh_auth_server 1.8.0 middleware.rs authenticate_request: the credentials are read first (a JWT that
+            // doesn't decode fails there, before the limiter, and isn't counted), then the limiter decides whether
+            // they are checked at all.
+            var (credentials, unreadable) = ReadCredentials(ctx);
+            if (unreadable is not null) return unreadable;
+            FakeUser? user = null;
+            var authenticated = Limited(_generalFailures, address, () =>
+            {
+                (user, var failure) = Check(credentials!);
+                return failure ?? Authenticated;
+            });
+            if (authenticated != Authenticated) return authenticated;
 
             return type switch
             {
@@ -392,36 +418,69 @@ public sealed class FakeKomodo : IAsyncDisposable
         await ctx.Response.WriteAsync(answer.Raw ?? JsonSerializer.Serialize(answer.Body), ctx.RequestAborted);
     }
 
-    // mogh_auth_server 1.8.0 middleware.rs: a JWT in Authorization ("Bearer " optional) comes first, then X-Api-Key with
-    // X-Api-Secret. A JWT that fails to decode or has expired is a plain anyhow error there, so HTTP 500, not 401.
-    private (FakeUser? User, Answer? Failure) Authenticate(HttpContext ctx)
+    private static readonly Answer Authenticated = new(200, null);
+
+    // mogh_rate_limit 1.0.1 lib.rs with_failure_rate_limit_using_ip: refused once the address has max_attempts failures
+    // in the window; otherwise run, and a failure is recorded and told how many attempts remain.
+    private Answer Limited(Dictionary<string, List<DateTimeOffset>> failures, string address, Func<Answer> run)
+    {
+        if (AuthRateLimit is not var (max, window)) return run();
+        var now = Time.GetUtcNow();
+        if (!failures.TryGetValue(address, out var times)) failures[address] = times = [];
+        times.RemoveAll(t => t <= now - window);
+        if (times.Count >= max)
+            return Error(429, $"Too many attempts | Try again in {Math.Ceiling((window - (now - times[0])).TotalSeconds)}s");
+
+        var answer = run();
+        if (answer.Status is >= 200 and < 300) return answer;
+        times.Add(now);
+        var error = answer.Body is null ? "" : JsonSerializer.SerializeToElement(answer.Body).GetProperty("error").GetString();
+        return Error(answer.Status, $"{error} | You have {max - times.Count} attempts remaining");
+    }
+
+    private abstract record Credentials
+    {
+        public sealed record Jwt(string UserId) : Credentials;
+
+        public sealed record Key(string ApiKey, string Secret) : Credentials;
+    }
+
+    // mogh_auth_server 1.8.0 middleware.rs extract_request_authentication: a JWT in Authorization ("Bearer " optional)
+    // comes first, then X-Api-Key with X-Api-Secret. A JWT that fails to decode or has expired is a plain anyhow error
+    // there, so HTTP 500, not 401; no credentials at all is a 401.
+    private (Credentials? Credentials, Answer? Failure) ReadCredentials(HttpContext ctx)
     {
         if (ctx.Request.Headers.TryGetValue("Authorization", out var authorization))
         {
             var jwt = authorization.ToString().Trim();
             if (jwt.StartsWith("Bearer ", StringComparison.Ordinal)) jwt = jwt["Bearer ".Length..];
-            return ReadJwt(jwt) is { } id && _users.TryGetValue(id, out var jwtUser)
-                ? (jwtUser, null)
-                : (null, Error(500, "Invalid user credentials"));
+            return ReadJwt(jwt) is { } id ? (new Credentials.Jwt(id), null) : (null, Error(500, "Invalid user credentials"));
         }
 
         if (ctx.Request.Headers.TryGetValue("X-Api-Key", out var keyHeader))
         {
             if (!ctx.Request.Headers.TryGetValue("X-Api-Secret", out var secretHeader))
                 return (null, Error(500, "Request headers have X-API-KEY but missing X-API-SECRET"));
-            // komodo bin/core/src/auth/middleware.rs: expiry with 5 minutes of clock skew tolerance, then the secret;
-            // mapped to 401 in bin/core/src/auth/mod.rs (handle_request_authentication).
-            // With its rate limiter on, Komodo appends " | You have N attempts remaining" (mogh_rate_limit 1.0.1); left out.
-            if (_keys.TryGetValue(keyHeader.ToString().Trim(), out var key)
-                && !key.Deleted
-                && (key.Expires == 0 || key.Expires >= Now() - 5 * 60 * 1000)
-                && key.Secret == secretHeader.ToString().Trim()
-                && _users.TryGetValue(key.UserId, out var keyUser))
-                return (keyUser, null);
-            return (null, Error(401, "Invalid user credentials"));
+            return (new Credentials.Key(keyHeader.ToString().Trim(), secretHeader.ToString().Trim()), null);
         }
 
         return (null, Error(401, "Invalid client credentials"));
+    }
+
+    // komodo bin/core/src/auth/middleware.rs extract_user_from_auth: a key's expiry with 5 minutes of clock skew
+    // tolerance, then its secret; the user must exist. Mapped to 401 in bin/core/src/auth/mod.rs (handle_request_authentication).
+    private (FakeUser? User, Answer? Failure) Check(Credentials credentials)
+    {
+        var userId = credentials switch
+        {
+            Credentials.Jwt jwt => jwt.UserId,
+            Credentials.Key k when _keys.TryGetValue(k.ApiKey, out var key)
+                && !key.Deleted
+                && (key.Expires == 0 || key.Expires >= Now() - 5 * 60 * 1000)
+                && key.Secret == k.Secret => key.UserId,
+            _ => null,
+        };
+        return userId is not null && _users.TryGetValue(userId, out var user) ? (user, null) : (null, Error(401, "Invalid user credentials"));
     }
 
     private string? ReadJwt(string jwt)
@@ -517,11 +576,14 @@ public sealed class FakeKomodo : IAsyncDisposable
         var names = p.TryGetProperty("query", out var q) && q.TryGetProperty("names", out var n)
             ? n.EnumerateArray().Select(x => x.GetString()).ToHashSet()
             : null;
+        // entities/resource.rs TemplatesQueryBehavior: Include (the default), Exclude or Only.
+        var templates = q.ValueKind == JsonValueKind.Object && q.TryGetProperty("templates", out var tq) ? tq.GetString() : "Include";
         var limit = p.TryGetProperty("limit", out var l) && l.ValueKind == JsonValueKind.Number ? l.GetInt32() : DefaultPaginationLimit;
         var page = p.TryGetProperty("page", out var pg) ? pg.GetInt32() : 0;
         var visible = _stacks.Values
             .Where(s => Has(user, s, FakePermission.Read))
             .Where(s => names is null || names.Count == 0 || names.Contains(s.Name))
+            .Where(s => templates switch { "Exclude" => !s.Template, "Only" => s.Template, _ => true })
             .OrderBy(s => s.Name, StringComparer.Ordinal)
             .Skip(limit == 0 ? 0 : page * limit);
         if (limit != 0) visible = visible.Take(limit);
@@ -530,7 +592,7 @@ public sealed class FakeKomodo : IAsyncDisposable
             id = s.Id,
             type = "Stack",
             name = s.Name,
-            template = false,
+            template = s.Template,
             tags = Array.Empty<string>(),
             info = new
             {
@@ -572,7 +634,7 @@ public sealed class FakeKomodo : IAsyncDisposable
         ["_id"] = new Dictionary<string, string> { ["$oid"] = s.Id },
         ["name"] = s.Name,
         ["description"] = "",
-        ["template"] = false,
+        ["template"] = s.Template,
         ["tags"] = Array.Empty<string>(),
         ["info"] = new { missing_files = Array.Empty<string>() },
         ["config"] = new { server_id = s.ServerId, swarm_id = s.SwarmId },
@@ -587,11 +649,19 @@ public sealed class FakeKomodo : IAsyncDisposable
         stack_name = s.Name,
         service = v.Service,
         image = v.Image,
-        container = s.SwarmId == "" ? new { name = $"{s.Name}-{v.Service}-1", image = v.Image, state = v.ContainerState, status = v.Status } : null,
+        container = s.SwarmId == "" ? ContainerJson(s, v) : null,
         swarm_service = s.SwarmId == "" ? null : new { ID = v.Service, Name = $"{s.Name}_{v.Service}", Image = v.Image },
         state = v.State,
         image_digests = (string[]?)null,
     };
+
+    // entities/docker/container.rs ContainerListItem: its Option fields are skip_serializing_if = "Option::is_none".
+    private static Dictionary<string, object> ContainerJson(FakeStack s, FakeService v)
+    {
+        var container = new Dictionary<string, object> { ["name"] = $"{s.Name}-{v.Service}-1", ["image"] = v.Image, ["state"] = v.ContainerState };
+        if (v.Status is { } status) container["status"] = status;
+        return container;
+    }
 
     // client/core/rs/src/entities/update.rs Log.
     private object LogJson(FakeLog log, long ts) => new

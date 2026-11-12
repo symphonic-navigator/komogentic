@@ -25,7 +25,12 @@ public sealed class KomodoClientTests : IAsyncLifetime
         _komodo = _fake.CreateClient();
     }
 
-    public async ValueTask DisposeAsync() => await _fake.DisposeAsync();
+    public async ValueTask DisposeAsync()
+    {
+        var violations = _fake.Violations;
+        await _fake.DisposeAsync();
+        Assert.True(violations.Count == 0, "The fake Core saw calls outside the closed list: " + string.Join(", ", violations));
+    }
 
     [Fact]
     public async Task Login_returns_the_jwt()
@@ -62,14 +67,14 @@ public sealed class KomodoClientTests : IAsyncLifetime
     public async Task Create_and_delete_api_key_with_the_jwt()
     {
         var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
-        var expires = new DateTime(2027, 2, 10, 12, 0, 0, DateTimeKind.Utc);
+        var expires = new DateTimeOffset(2027, 2, 10, 12, 0, 0, TimeSpan.Zero);
 
         var created = await _komodo.CreateApiKeyAsync(jwt, "komogentic/Hermes", expires, Ct);
 
         Assert.Matches("^K_[A-Za-z0-9]{40}_K$", created.Key);
         Assert.Matches("^S_[A-Za-z0-9]{40}_S$", created.Secret);
         var stored = Assert.Single(_fake.ApiKeys);
-        Assert.Equal(("u-anna", "komogentic/Hermes", new DateTimeOffset(expires).ToUnixTimeMilliseconds()), (stored.UserId, stored.Name, stored.Expires));
+        Assert.Equal(("u-anna", "komogentic/Hermes", expires.ToUnixTimeMilliseconds()), (stored.UserId, stored.Name, stored.Expires));
         var create = _fake.Requests[^1];
         Assert.Equal(("/auth/manage", "CreateApiKey", "jwt", null), (create.Path, create.Type, create.AuthKind, create.ApiKey));
 
@@ -94,6 +99,31 @@ public sealed class KomodoClientTests : IAsyncLifetime
         await _komodo.DeleteApiKeyAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), "K_gone_K", Ct);
 
         Assert.Equal(("/auth/manage", "DeleteApiKey", "jwt"), Last());
+    }
+
+    [Fact]
+    public async Task Create_api_key_expiry_is_sent_in_utc_milliseconds()
+    {
+        var expires = new DateTimeOffset(2027, 2, 10, 14, 0, 0, TimeSpan.FromHours(2));
+
+        await _komodo.CreateApiKeyAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), "komogentic/Hermes", expires, Ct);
+
+        Assert.Equal(1_802_260_800_000, _fake.Requests[^1].Params.GetProperty("expires").GetInt64());
+    }
+
+    [Fact]
+    public async Task Delete_with_any_other_404_is_a_failure()
+    {
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+        // A proxy in front of Komodo that doesn't know the route, and a 404 of Komodo's that isn't about the key.
+        _fake.FailNext("DeleteApiKey", 404, "<html>404 page not found</html>");
+        _fake.FailNext("DeleteApiKey", 404, FakeKomodo.ErrorBody("Failed to find user"));
+
+        var proxy = await Assert.ThrowsAsync<KomodoException>(() => _komodo.DeleteApiKeyAsync(jwt, "K_gone_K", Ct));
+        var other = await Assert.ThrowsAsync<KomodoException>(() => _komodo.DeleteApiKeyAsync(jwt, "K_gone_K", Ct));
+
+        Assert.Equal((KomodoErrorKind.NotFoundOrForbidden, 404), (proxy.Kind, proxy.Status));
+        Assert.Equal((KomodoErrorKind.NotFoundOrForbidden, 404), (other.Kind, other.Status));
     }
 
     [Fact]
@@ -202,6 +232,26 @@ public sealed class KomodoClientTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Only_komodos_credential_errors_are_unauthorized()
+    {
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+        // An auth proxy in front of Komodo, and a 401 of Komodo's that says nothing about the credentials.
+        _fake.FailNext("ListStacks", 401, "");
+        _fake.FailNext("ListStacks", 401, FakeKomodo.ErrorBody("Local auth is not enabled"));
+        _fake.FailNext("ListStacks", 401, FakeKomodo.ErrorBody("Invalid client credentials"));
+        _fake.FailNext("ListStacks", 500, FakeKomodo.ErrorBody("Invalid user credentials | You have 4 attempts remaining"));
+        _fake.FailNext("ListStacks", 403, FakeKomodo.ErrorBody("Invalid user credentials"));
+
+        Assert.Equal((KomodoErrorKind.Failed, 401), Classified(await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))));
+        Assert.Equal((KomodoErrorKind.Failed, 401), Classified(await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))));
+        Assert.Equal((KomodoErrorKind.Unauthorized, 401), Classified(await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))));
+        Assert.Equal((KomodoErrorKind.Unauthorized, 500), Classified(await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))));
+        Assert.NotEqual(KomodoErrorKind.Unauthorized, (await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))).Kind);
+
+        static (KomodoErrorKind, int) Classified(KomodoException e) => (e.Kind, e.Status);
+    }
+
+    [Fact]
     public async Task Rate_limited_is_its_own_kind()
     {
         _fake.RateLimited = true;
@@ -210,7 +260,36 @@ public sealed class KomodoClientTests : IAsyncLifetime
 
         Assert.Equal(KomodoErrorKind.RateLimited, e.Kind);
         Assert.Equal(429, e.Status);
-        Assert.Equal("Komodo is refusing sign-ins for a moment after several failures; try again in a minute.", e.Message);
+        Assert.StartsWith(
+            "Komodo is refusing requests from Komogentic for a moment after several failed authentications; try again in a minute.", e.Message);
+        Assert.Contains("Try again in 15s", e.Message);
+
+        _fake.RateLimited = false;
+        _fake.FailNext("ListStacks", 429, "");
+        var bare = await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), Ct));
+        Assert.Equal(
+            "Komodo is refusing requests from Komogentic for a moment after several failed authentications; try again in a minute.", bare.Message);
+    }
+
+    [Fact]
+    public async Task Failed_authentications_trip_komodos_limit_for_valid_requests_too()
+    {
+        _fake.AuthRateLimit = (5, TimeSpan.FromSeconds(15));
+        var key = _fake.IssueKey("u-anna", "komogentic/Hermes");
+        var valid = new KomodoAuth.Key(key.Key, key.Secret);
+        var wrong = new KomodoAuth.Key(key.Key, "S_wrong_S");
+
+        await _komodo.ListStacksAsync(valid, Ct);
+        for (var i = 0; i < 5; i++)
+        {
+            var refused = await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(wrong, Ct));
+            Assert.Equal(KomodoErrorKind.Unauthorized, refused.Kind);
+        }
+
+        var limited = await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(valid, Ct));
+        Assert.Equal((KomodoErrorKind.RateLimited, 429), (limited.Kind, limited.Status));
+        Assert.Equal(KomodoErrorKind.RateLimited,
+            (await Assert.ThrowsAsync<KomodoException>(() => _komodo.GetStackAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), "app", Ct))).Kind);
     }
 
     [Fact]
@@ -262,6 +341,83 @@ public sealed class KomodoClientTests : IAsyncLifetime
         Assert.Equal((KomodoErrorKind.Failed, 500), (failed.Kind, failed.Status));
         Assert.Contains("Failed to query db", failed.Message);
         Assert.Equal(KomodoErrorKind.Unreachable, (await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct))).Kind);
+    }
+
+    [Fact]
+    public async Task Answer_without_a_required_field_is_an_unknown_shape()
+    {
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+        _fake.FailNext("ListStacks", 200, """[{"id":"65f0c0ffee0000000000a001","type":"Stack","name":"app","template":false,"tags":[]}]""");
+        _fake.FailNext("ListStacks", 200, """[{"id":"65f0c0ffee0000000000a001","type":"Stack","name":null,"template":false,"tags":[],"info":{}}]""");
+
+        var missing = await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct));
+        var nulled = await Assert.ThrowsAsync<KomodoException>(() => _komodo.ListStacksAsync(jwt, Ct));
+
+        Assert.Equal((KomodoErrorKind.Failed, "Komodo answered in a shape Komogentic does not know (ListStacks)."), (missing.Kind, missing.Message));
+        Assert.Equal((KomodoErrorKind.Failed, "Komodo answered in a shape Komogentic does not know (ListStacks)."), (nulled.Kind, nulled.Message));
+    }
+
+    [Fact]
+    public async Task Answer_larger_than_komogentic_reads_is_a_failure()
+    {
+        _fake.FailNext("GetStackLog", 200, "\"" + new string('x', KomodoClient.MaxAnswerBytes) + "\"");
+
+        var e = await Assert.ThrowsAsync<KomodoException>(() =>
+            _komodo.GetStackLogAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), "app", [], 5000, false, Ct));
+
+        Assert.Equal((KomodoErrorKind.Failed, "Komodo's answer to GetStackLog is larger than Komogentic reads."), (e.Kind, e.Message));
+    }
+
+    [Fact]
+    public async Task Fields_komodo_leaves_out_when_empty_may_be_missing()
+    {
+        // ContainerListItem's status is skip_serializing_if = "Option::is_none" (entities/docker/container.rs).
+        _fake.Stack("app").Services[0] = new FakeService("web", "nginx:1.27", Status: null);
+
+        var service = Assert.Single(await _komodo.ListStackServicesAsync(new KomodoAuth.Jwt(_fake.IssueJwt("u-anna")), "app", Ct));
+
+        Assert.Equal(("running", null), (service.Container?.State, service.Container?.Status));
+    }
+
+    [Fact]
+    public async Task List_stacks_leaves_out_templates()
+    {
+        _fake.AddStack("65f0c0ffee0000000000c003", "app-template", "server-1", "unknown").Template = true;
+        _fake.Grant("u-anna", "65f0c0ffee0000000000c003", FakePermission.Read);
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+
+        Assert.Equal(["app"], (await _komodo.ListStacksAsync(jwt, Ct)).Select(s => s.Name));
+        Assert.Equal("Exclude", _fake.Requests[^1].Params.GetProperty("query").GetProperty("templates").GetString());
+        Assert.Null(await _komodo.FindStackAsync(jwt, "app-template", Ct));
+        Assert.Equal("Exclude", _fake.Requests[^1].Params.GetProperty("query").GetProperty("templates").GetString());
+    }
+
+    [Fact]
+    public async Task Get_update_refuses_a_malformed_id_without_asking()
+    {
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+        var before = _fake.Requests.Count;
+
+        foreach (var id in (string[])["", "../read", "65F0C0FFEE0000000000A001", "65f0c0ffee0000000000a0011", "{\"$ne\":null}"])
+        {
+            var e = await Assert.ThrowsAsync<KomodoException>(() => _komodo.GetUpdateAsync(jwt, id, Ct));
+            Assert.Equal(KomodoErrorKind.NotFoundOrForbidden, e.Kind);
+        }
+
+        Assert.Equal(before, _fake.Requests.Count);
+    }
+
+    [Fact]
+    public async Task Update_komodo_does_not_show_is_not_found_or_forbidden()
+    {
+        var jwt = new KomodoAuth.Jwt(_fake.IssueJwt("u-anna"));
+        _fake.FailNext("GetUpdate", 500, FakeKomodo.ErrorBody("user must be admin to view system updates"));
+
+        var system = await Assert.ThrowsAsync<KomodoException>(() => _komodo.GetUpdateAsync(jwt, "65f0c0ffee0000000000d004", Ct));
+        var unknown = await Assert.ThrowsAsync<KomodoException>(() => _komodo.GetUpdateAsync(jwt, "65f0c0ffee0000000000d004", Ct));
+
+        Assert.Equal(KomodoErrorKind.NotFoundOrForbidden, system.Kind);
+        Assert.Equal(KomodoErrorKind.NotFoundOrForbidden, unknown.Kind);
     }
 
     [Fact]
@@ -333,13 +489,15 @@ public sealed class KomodoClientTests : IAsyncLifetime
     [Fact]
     public async Task Calls_outside_the_closed_list_are_violations()
     {
-        using var http = _fake.CreateHttpClient();
+        // A fake of its own: this test's violation is meant, and the shared one must end without any.
+        await using var fake = await FakeKomodo.StartAsync();
+        using var http = fake.CreateHttpClient();
 
         using var response = await http.PostAsync("/execute",
             new StringContent("""{"type":"DestroyStack","params":{"stack":"app"}}""", Encoding.UTF8, "application/json"), Ct);
 
         Assert.Equal(400, (int)response.StatusCode);
-        Assert.Equal(["/execute DestroyStack"], _fake.Violations);
+        Assert.Equal(["/execute DestroyStack"], fake.Violations);
     }
 
     [Fact]
@@ -384,5 +542,13 @@ public sealed class KomodoRegistrationTests(AppFactory app)
         var result = await komodo.LoginLocalUserAsync("registered", "registered-password", TestContext.Current.CancellationToken);
 
         Assert.Equal("u-reg", KomodoJwt.Read(result.Jwt!)?.UserId);
+    }
+
+    [Fact]
+    public void Client_buffers_at_most_16_mb_of_an_answer()
+    {
+        var http = app.Services.GetRequiredService<IHttpClientFactory>().CreateClient(nameof(KomodoClient));
+
+        Assert.Equal(16 * 1024 * 1024, http.MaxResponseContentBufferSize);
     }
 }

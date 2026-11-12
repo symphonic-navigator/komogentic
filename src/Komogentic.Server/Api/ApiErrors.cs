@@ -23,6 +23,11 @@ public static class ApiErrors
     /// <summary>What a session whose JWT Komodo no longer accepts is told; the session is ended with it.</summary>
     public const string KomodoSignInEnded = "Your Komodo sign-in has ended; sign in again.";
 
+    /// <summary>What the dashboard is told when Komodo did not answer.</summary>
+    public const string KomodoUnreachable = "Komodo could not be reached; try again in a minute.";
+
+    private static readonly TimeSpan KomodoRetryAfter = TimeSpan.FromMinutes(1);
+
     public static ApiException BadRequest(string message) => new(StatusCodes.Status400BadRequest, message);
 
     public static ApiException TooMany(TimeSpan retryAfter, string message = "Too many attempts; try again in a minute.") =>
@@ -32,7 +37,8 @@ public static class ApiErrors
     /// The endpoint filter of every <c>/api</c> group: the refusals handlers and services throw become statuses. Only
     /// these: anything else is a fault and stays a 500, without its message. A Komodo call with the session's JWT that
     /// Komodo refuses as unauthorised (the JWT expired or was invalidated early) ends the session: the dashboard shows
-    /// sign-in again. It never marks a credential.
+    /// sign-in again. It never marks a credential. Komodo's other failures: 503 when it did not answer, 429 when its
+    /// rate limiter refuses Komogentic, else 502 with Komodo's own message (which never holds a credential).
     /// </summary>
     public static async ValueTask<object?> Filter(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
     {
@@ -51,7 +57,14 @@ public static class ApiErrors
             await SessionApi.EndSessionAsync(context.HttpContext, CancellationToken.None);
             return Result(StatusCodes.Status401Unauthorized, KomodoSignInEnded);
         }
-        catch (ConnectionNameTakenException e)
+        catch (KomodoException e) when (e.Kind != KomodoErrorKind.Unauthorized)
+        {
+            if (e.Kind == KomodoErrorKind.Unreachable) return Result(StatusCodes.Status503ServiceUnavailable, KomodoUnreachable);
+            if (e.Kind != KomodoErrorKind.RateLimited) return Result(StatusCodes.Status502BadGateway, $"Komodo refused this: {e.Message}");
+            SetRetryAfter(context.HttpContext, KomodoRetryAfter);
+            return Result(StatusCodes.Status429TooManyRequests, e.Message);
+        }
+        catch (CredentialNameTakenException e)
         {
             return Result(StatusCodes.Status409Conflict, e.Message);
         }
