@@ -45,6 +45,7 @@ public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
     {
         builder.UseSetting("Komogentic:Mongo:ConnectionString", MongoConnectionString);
         builder.UseSetting("Komogentic:Mongo:Database", DatabaseName);
+        builder.UseSetting("Komogentic:Komodo:Url", "http://komodo.invalid");
     }
 }
 
