@@ -61,6 +61,11 @@ public sealed class RequestCaller
     public static RequestCaller ForApiKey(ResolvedApiKey key) =>
         new(CallerKind.ApiKey, key.User, key.Komodo, key.Id, key.Name, null, false, key.ExpiresAt);
 
+    /// <summary>An app on a connection's URL with an access token that <see cref="OAuth.OAuthTokens.ResolveAccessAsync"/>
+    /// found valid: Komodo as the connection's own Komodo key, the read tools only if the grant is read-only.</summary>
+    public static RequestCaller ForConnection(OAuth.ResolvedConnection connection) =>
+        new(CallerKind.Connection, connection.User, connection.Komodo, connection.ConnectionId, connection.Name, connection.ClientName, connection.ReadOnly, connection.ExpiresAt);
+
     /// <summary>The caller of the current request. Fails closed: a service asking on a request without a
     /// caller (an anonymous endpoint) is a bug, never a reason to fall back to some default.</summary>
     internal static RequestCaller Current(IServiceProvider services) =>

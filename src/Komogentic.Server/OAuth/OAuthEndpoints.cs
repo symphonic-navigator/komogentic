@@ -6,6 +6,7 @@ using Komogentic.Server.Accounts;
 using Komogentic.Server.Api;
 using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 
 namespace Komogentic.Server.OAuth;
 
@@ -26,7 +27,132 @@ public static partial class OAuthEndpoints
     {
         app.MapPost("/oauth/register", RegisterAsync).AllowAnonymous().ExcludeFromDescription();
         app.MapGet("/oauth/authorize", AuthorizeAsync).AllowAnonymous().ExcludeFromDescription();
+        app.MapPost("/oauth/token", TokenAsync).AllowAnonymous().ExcludeFromDescription();
+        app.MapPost("/oauth/revoke", RevokeAsync).AllowAnonymous().ExcludeFromDescription();
     }
+
+    /// <summary>A token request is a few hundred bytes of form; more is not one.</summary>
+    public const int MaxTokenRequestBytes = 16 * 1024;
+
+    /// <summary>
+    /// The token endpoint (spec §5, RFC 6749 §3.2, §4.1.3, §5, §6): a form POST only, each parameter at most once.
+    /// <c>authorization_code</c> exchanges a code (<see cref="OAuthTokens.ExchangeCodeAsync"/>), <c>refresh_token</c>
+    /// rotates a refresh token (<see cref="OAuthTokens.RefreshAsync"/>); any other grant is <c>unsupported_grant_type</c>.
+    /// Failures are limited per <c>client_id</c> and network together (<see cref="OAuthLimits"/>, amendment R7), so
+    /// neither a stranger naming claude.ai's client id nor Anthropic's shared range stops the others. Every answer is
+    /// <c>no-store</c>; tokens are never logged.
+    /// </summary>
+    private static async Task<IResult> TokenAsync(HttpContext http, OAuthTokens tokens, OAuthLimits limits, CancellationToken ct)
+    {
+        http.Response.Headers.CacheControl = "no-store";
+        http.Response.Headers.Pragma = "no-cache";
+        if (!IsForm(http.Request.ContentType)) return Error(StatusCodes.Status400BadRequest, "invalid_request", "The body must be application/x-www-form-urlencoded.");
+        var body = await ReadBodyAsync(http.Request, MaxTokenRequestBytes, ct);
+        if (body is null) return Error(StatusCodes.Status400BadRequest, "invalid_request", "The request body is too large.");
+        if (ParseForm(body) is not { } form) return Error(StatusCodes.Status400BadRequest, "invalid_request", "The body is not a usable form.");
+
+        // A missing client_id is counted under the empty one: a public client always sends its id.
+        var clientId = form.TryGetValue("client_id", out var ids) && ids.Count == 1 ? ids[0] ?? "" : "";
+        if (limits.TokenReserve(http, clientId) is { } retryAfter)
+        {
+            ApiErrors.SetRetryAfter(http, retryAfter);
+            return Error(StatusCodes.Status429TooManyRequests, "invalid_request", "Too many failed token requests for this client; try again later.");
+        }
+
+        TokenResult result;
+        try
+        {
+            result = await TokenResultAsync(form, tokens, ct);
+        }
+        catch
+        {
+            // MongoDB unreachable or the request aborted: not a failure of the client's.
+            limits.TokenRelease(http, clientId);
+            throw;
+        }
+
+        if (result.Pair is not { } pair)
+        {
+            limits.TokenFailed(http, clientId);
+            return Error(result.Error == "invalid_client" ? StatusCodes.Status401Unauthorized : StatusCodes.Status400BadRequest, result.Error!, result.Description!);
+        }
+
+        limits.TokenRelease(http, clientId);
+        return TypedResults.Json(new JsonObject
+        {
+            ["access_token"] = pair.AccessToken,
+            ["token_type"] = "Bearer",
+            ["expires_in"] = pair.ExpiresIn,
+            ["refresh_token"] = pair.RefreshToken,
+            ["scope"] = pair.Scope,
+        });
+    }
+
+    private static async Task<TokenResult> TokenResultAsync(Dictionary<string, StringValues> form, OAuthTokens tokens, CancellationToken ct)
+    {
+        // RFC 6749 §3.2: no parameter more than once; an empty one counts as missing.
+        if (form.Values.Any(v => v.Count > 1)) return TokenResult.Failure("invalid_request", "Each parameter may be sent once.");
+        string? Field(string name) => form.TryGetValue(name, out var v) && !string.IsNullOrEmpty(v[0]) ? v[0] : null;
+
+        var grantType = Field("grant_type");
+        if (grantType is null) return TokenResult.Failure("invalid_request", "grant_type is required.");
+        if (grantType is not ("authorization_code" or "refresh_token"))
+            return TokenResult.Failure("unsupported_grant_type", "Only the authorization_code and refresh_token grants are supported.");
+        if (Field("client_id") is not { } clientId) return TokenResult.Failure("invalid_client", "client_id is required: clients are public and identify themselves by it.");
+        if (grantType == "refresh_token")
+        {
+            // A scope, if sent, can't widen the grant (RFC 6749 §6) and narrows nothing either: the grant's is sealed.
+            if (Field("refresh_token") is not { } refreshToken) return TokenResult.Failure("invalid_request", "refresh_token is required.");
+            return await tokens.RefreshAsync(refreshToken, clientId, Field("resource"), ct);
+        }
+
+        if (Field("code") is not { } code || Field("redirect_uri") is not { } redirectUri || Field("code_verifier") is not { } verifier)
+            return TokenResult.Failure("invalid_request", "code, redirect_uri and code_verifier are required.");
+        if (!VerifierShape().IsMatch(verifier)) return TokenResult.Failure("invalid_request", "code_verifier must be 43 to 128 characters of A-Z, a-z, 0-9, '-', '.', '_' and '~'.");
+        return await tokens.ExchangeCodeAsync(new CodeExchange(code, clientId, redirectUri, verifier, Field("resource")), ct);
+    }
+
+    /// <summary>
+    /// Revocation by the client (RFC 7009, <see cref="OAuthTokens.RevokeAsync"/>): a form POST with <c>token</c> and
+    /// optionally <c>token_type_hint</c> and <c>client_id</c>. The hint is not needed, the token's prefix says what it
+    /// is. Always 200 with an empty body, also for a token that is unknown, already revoked or not sent, so the answer
+    /// tells nothing about a token (RFC 7009 §2.2); <c>no-store</c> like the token endpoint.
+    /// </summary>
+    private static async Task<IResult> RevokeAsync(HttpContext http, OAuthTokens tokens, CancellationToken ct)
+    {
+        http.Response.Headers.CacheControl = "no-store";
+        http.Response.Headers.Pragma = "no-cache";
+        if (IsForm(http.Request.ContentType)
+            && await ReadBodyAsync(http.Request, MaxTokenRequestBytes, ct) is { } body
+            && ParseForm(body) is { } form
+            && form.TryGetValue("token", out var token) && token.Count == 1 && !string.IsNullOrEmpty(token[0]))
+        {
+            await tokens.RevokeAsync(token[0]!, ct);
+        }
+
+        return TypedResults.Ok();
+    }
+
+    /// <summary>A token or revocation request's form, or null if it isn't one.</summary>
+    private static Dictionary<string, StringValues>? ParseForm(byte[] body)
+    {
+        try
+        {
+            return new FormReader(System.Text.Encoding.UTF8.GetString(body)) { ValueCountLimit = 32, KeyLengthLimit = 64, ValueLengthLimit = MaxTokenRequestBytes }.ReadForm();
+        }
+        catch (InvalidDataException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsForm(string? contentType) =>
+        Microsoft.Net.Http.Headers.MediaTypeHeaderValue.TryParse(contentType, out var type)
+        && type.MediaType.Equals("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>RFC 7636 §4.1: 43 to 128 unreserved characters.</summary>
+    [GeneratedRegex("^[A-Za-z0-9._~-]{43,128}$")]
+    private static partial Regex VerifierShape();
 
     /// <summary>
     /// The authorisation endpoint. Anonymous, and it never reads the cookie: claude.ai's navigation here is
@@ -230,7 +356,7 @@ public static partial class OAuthEndpoints
         return buffer.ToArray();
     }
 
-    // RFC 7591 §3.2.2 / RFC 6749 §5.2: {"error", "error_description"}.
+    // RFC 7591 §3.2.2 / RFC 6749 §5.2: {"error", "error_description"}, never cached.
     private static IResult Error(int status, string error, string description) =>
         TypedResults.Json(new { error, error_description = description }, statusCode: status);
 }

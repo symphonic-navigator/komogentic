@@ -12,15 +12,15 @@ public interface ICredentialHealth
     Task KomodoKeyRejectedAsync(RequestCaller caller, string komodoKey, CancellationToken ct);
 }
 
-public sealed class CredentialHealth(ApiKeys apiKeys) : ICredentialHealth
+public sealed class CredentialHealth(ApiKeys apiKeys, Connections connections) : ICredentialHealth
 {
-    public const string KomodoKeyRejected = "komodo_key_rejected";
+    public const string KomodoKeyRejected = ConnectionReasons.KomodoKeyRejected;
 
     public Task KomodoKeyRejectedAsync(RequestCaller caller, string komodoKey, CancellationToken ct) => caller.Kind switch
     {
         CallerKind.ApiKey => apiKeys.MarkDeadAsync(caller.CredentialId!, komodoKey, KomodoKeyRejected, ct),
-        // Task 8b: Connections.MarkKomodoKeyRejectedAsync (needs reconnect). Until then no connection reaches a tool.
-        CallerKind.Connection => throw new NotSupportedException("Connections can't call tools yet"),
+        // Needs a reconnect, which a new consent on the same URL makes.
+        CallerKind.Connection => connections.MarkKomodoKeyRejectedAsync(caller.CredentialId!, komodoKey, ct),
         // A session's JWT is never a Komodo key: a rejected JWT ends the session (ApiErrors.Filter).
         _ => Task.CompletedTask,
     };

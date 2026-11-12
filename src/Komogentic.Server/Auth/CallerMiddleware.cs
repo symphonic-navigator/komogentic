@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 using Komogentic.Server.Accounts;
+using Komogentic.Server.OAuth;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Routing.Patterns;
+using Microsoft.Extensions.Options;
 
 namespace Komogentic.Server.Auth;
 
@@ -10,7 +12,7 @@ namespace Komogentic.Server.Auth;
 /// <list type="bullet">
 /// <item>under <c>/api</c>, only the session cookie <see cref="SessionCookie"/>;</item>
 /// <item>under <c>/mcp</c>, only an API key (<see cref="ApiKeyCallerAsync"/>);</item>
-/// <item>on a connection's URL <c>/mcp/c/{id}</c>, only that connection's access tokens (<see cref="ConnectionCallerAsync"/>).</item>
+/// <item>on a connection's URL <c>/mcp/c/{id}</c>, only that connection's access tokens (<see cref="ConnectionUrlAsync"/>), and an unknown id is a 404.</item>
 /// </list>
 /// Which requests need one fails closed: every matched endpoint unless it is marked <c>AllowAnonymous()</c>
 /// (<c>/healthz</c>, discovery, the OAuth endpoints, <c>POST /api/session</c>), and every path under <c>/api</c> or
@@ -18,7 +20,8 @@ namespace Komogentic.Server.Auth;
 /// anonymous endpoint is mapped there itself: an anonymous fallback (the web app's) doesn't count. Runs after routing
 /// and before any endpoint; never logs a key, a token or a cookie.
 /// </summary>
-public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, ApiKeys apiKeys, WrongKeyLimiter wrongKeys)
+public sealed class CallerMiddleware(
+    RequestDelegate next, IOptions<KomogenticOptions> options, Sessions sessions, ApiKeys apiKeys, Connections connections, OAuthTokens tokens, WrongKeyLimiter wrongKeys)
 {
     public const string SessionCookie = "kgt_session";
 
@@ -31,6 +34,13 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
 
     public async Task InvokeAsync(HttpContext context)
     {
+        // Everything under /mcp/c is a connection's, /mcp/c and /mcp/c/ without an id too: never the API keys'.
+        if (IsUnder(context, "/mcp/c"))
+        {
+            await ConnectionUrlAsync(context, ConnectionIdSegment(context) ?? "");
+            return;
+        }
+
         if (!NeedsCaller(context))
         {
             await next(context);
@@ -39,8 +49,6 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
 
         RequestCaller? caller;
         if (IsUnder(context, "/api")) caller = await SessionCallerAsync(context);
-        // Everything under /mcp/c is a connection's, /mcp/c and /mcp/c/ without an id too: never the API keys'.
-        else if (IsUnder(context, "/mcp/c")) caller = await ConnectionCallerAsync(context, ConnectionIdSegment(context) ?? "");
         else
         {
             (caller, var retryAfter) = await ApiKeyCallerAsync(context);
@@ -132,9 +140,63 @@ public sealed class CallerMiddleware(RequestDelegate next, Sessions sessions, Ap
         return (RequestCaller.ForApiKey(key), null);
     }
 
-    /// <summary>A connection's URL: that connection's access tokens only (Task 8a). Until then nothing opens it, and an
-    /// unknown id is a 401 like a known one.</summary>
-    private static Task<RequestCaller?> ConnectionCallerAsync(HttpContext context, string connectionId) => Task.FromResult<RequestCaller?>(null);
+    /// <summary>
+    /// A connection's own URL takes only its access tokens (spec §5): API keys and the cookie are not resolved here, so a
+    /// credential for <c>/mcp</c> or <c>/api</c> opens nothing on it, and an access token is resolved nowhere else. An id
+    /// that is no connection's is a 404, like its metadata URL; a known one, in any state, answers a request without a
+    /// valid token with a 401 and the challenge that leads an app to the metadata. An access token is looked up under
+    /// the wrong-key limit; one that is known but no longer valid here (expired, another connection's, revoked
+    /// meanwhile) isn't a guess and gives its permit back, an unknown one uses it up. Any other bearer is refused
+    /// without a lookup.
+    /// </summary>
+    private async Task ConnectionUrlAsync(HttpContext context, string id)
+    {
+        if (!OAuthUrls.IsConnectionId(id) || await connections.FindAsync(id, context.RequestAborted) is null)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            await context.Response.WriteAsJsonAsync(new Api.ApiError("Not found."));
+            return;
+        }
+
+        var origin = OAuthUrls.Origin(context, options.Value.PublicUrl);
+        var header = context.Request.Headers.Authorization.ToString();
+        var bearer = header.StartsWith(BearerScheme, StringComparison.OrdinalIgnoreCase) ? header[BearerScheme.Length..].Trim() : null;
+        if (bearer is not null && bearer.StartsWith(OAuthTokens.AccessPrefix, StringComparison.Ordinal))
+        {
+            var ip = WrongKeyLimiter.Partition(context.Connection.RemoteIpAddress);
+            if (wrongKeys.TryReserve(ip) is { } retryAfter)
+            {
+                await TooManyAsync(context, retryAfter);
+                return;
+            }
+
+            AccessResolution resolution;
+            try
+            {
+                resolution = await tokens.ResolveAccessAsync(bearer, id, OAuthUrls.Resource(origin, id), context.RequestAborted);
+            }
+            catch
+            {
+                // MongoDB unreachable or the request aborted: not a wrong key.
+                wrongKeys.Release(ip);
+                throw;
+            }
+
+            if (resolution.Known) wrongKeys.Release(ip);
+            else wrongKeys.Failed(ip);
+            if (resolution.Connection is { } connection)
+            {
+                context.Features.Set(RequestCaller.ForConnection(connection));
+                await next(context);
+                return;
+            }
+        }
+
+        var challenge = $"Bearer resource_metadata=\"{OAuthUrls.ResourceMetadata(origin, id)}\", scope=\"{OAuthScopes.Challenge}\"";
+        if (bearer is not null) challenge += ", error=\"invalid_token\"";
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        context.Response.Headers.WWWAuthenticate = challenge;
+    }
 
     /// <summary>The third segment of <c>/mcp/c/{id}…</c> (the prefix case-insensitive, as routing is), else null.</summary>
     private static string? ConnectionIdSegment(HttpContext context)

@@ -6,16 +6,21 @@ using Komogentic.Server.Komodo;
 
 namespace Komogentic.Server.Api;
 
-/// <summary>Every error the dashboard's API returns: one sentence for a person to read.</summary>
-public sealed record ApiError(string Error);
+/// <summary>Every error the dashboard's API returns: one sentence for a person to read; <c>Type</c> for the few the web
+/// app answers itself (<see cref="ApiErrors.OtherAccount"/>), left out otherwise.</summary>
+public sealed record ApiError(
+    string Error,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Type = null);
 
 /// <summary>Thrown by a handler to answer with <see cref="Status"/> and an <see cref="ApiError"/>; turned into
 /// the response by <see cref="ApiErrors.Filter"/>, so handlers can keep their typed success results.</summary>
-public sealed class ApiException(int status, string message, TimeSpan? retryAfter = null) : Exception(message)
+public sealed class ApiException(int status, string message, TimeSpan? retryAfter = null, string? type = null) : Exception(message)
 {
     public int Status { get; } = status;
 
     public TimeSpan? RetryAfter { get; } = retryAfter;
+
+    public string? Type { get; } = type;
 }
 
 public static class ApiErrors
@@ -26,7 +31,12 @@ public static class ApiErrors
     /// <summary>What the dashboard is told when Komodo did not answer.</summary>
     public const string KomodoUnreachable = "Komodo could not be reached; try again in a minute.";
 
+    /// <summary>The <c>type</c> of a 404 for a request of another account's connection: the consent page offers to sign out.</summary>
+    public const string OtherAccount = "other-account";
+
     private static readonly TimeSpan KomodoRetryAfter = TimeSpan.FromMinutes(1);
+
+    public static ApiException NotFound(string message, string? type = null) => new(StatusCodes.Status404NotFound, message, type: type);
 
     public static ApiException BadRequest(string message) => new(StatusCodes.Status400BadRequest, message);
 
@@ -49,7 +59,7 @@ public static class ApiErrors
         catch (ApiException e)
         {
             if (e.RetryAfter is { } retryAfter) SetRetryAfter(context.HttpContext, retryAfter);
-            return Result(e.Status, e.Message);
+            return Result(e.Status, e.Message, e.Type);
         }
         catch (KomodoException e) when (e.Kind == KomodoErrorKind.Unauthorized
             && context.HttpContext.Features.Get<RequestCaller>() is { Kind: CallerKind.Session, Komodo: KomodoAuth.Jwt })
@@ -76,7 +86,7 @@ public static class ApiErrors
         }
     }
 
-    public static IResult Result(int status, string message) => TypedResults.Json(new ApiError(message), statusCode: status);
+    public static IResult Result(int status, string message, string? type = null) => TypedResults.Json(new ApiError(message, type), statusCode: status);
 
     /// <summary>Whole seconds, at least one.</summary>
     public static void SetRetryAfter(HttpContext context, TimeSpan retryAfter) =>

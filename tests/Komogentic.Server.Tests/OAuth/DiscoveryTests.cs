@@ -3,6 +3,7 @@ using System.Net;
 using System.Text.Json.Nodes;
 using Komogentic.Server.Accounts;
 using Komogentic.Server.OAuth;
+using Komogentic.Server.Tests.Api;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -92,6 +93,62 @@ public sealed class DiscoveryTests(AppFactory app)
         Assert.Null(OAuthUrls.ConnectionIdOf(Origin, $"https://other.test/mcp/c/{id}"));
         Assert.Null(OAuthUrls.ConnectionIdOf(Origin, $"http://komogentic.test/mcp/c/{id}"));
         Assert.Null(OAuthUrls.ConnectionIdOf(Origin, $"https://komogentic.test/mcp/c/{id}/more"));
+    }
+
+    private const string Scope = "komodo:read komodo:operate";
+
+    private static string Challenge(string id) =>
+        $"Bearer resource_metadata=\"{Origin}/.well-known/oauth-protected-resource/mcp/c/{id}\", scope=\"{Scope}\"";
+
+    private static string RawWwwAuthenticate(HttpResponseMessage response) => response.Headers.GetValues("WWW-Authenticate").Single();
+
+    [Fact]
+    public async Task Unauthenticated_connection_url_answers_401_with_the_challenge()
+    {
+        var id = await ConnectionAsync();
+
+        using var response = await OAuthFlow.InitializeAsync(Api, $"/mcp/c/{id}", bearer: null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(Challenge(id), RawWwwAuthenticate(response));
+    }
+
+    [Fact]
+    public async Task A_wrong_bearer_adds_invalid_token()
+    {
+        var id = await ConnectionAsync();
+
+        using var response = await OAuthFlow.InitializeAsync(Api, $"/mcp/c/{id}", "kgt_at_x");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(Challenge(id) + ", error=\"invalid_token\"", RawWwwAuthenticate(response));
+    }
+
+    [Fact]
+    public async Task An_api_key_is_refused_on_a_connection_url()
+    {
+        var owner = await Owner.NewAsync(app, Api);
+        var id = await OAuthFlow.ConnectionAsync(Api, owner);
+        using var created = await Api.SendAsync(HttpMethod.Post, "/api/keys", new { name = "Hermes" }, owner.Session);
+        var key = (await Dashboard.JsonAsync(created)).GetProperty("secret").GetString()!;
+
+        using var onConnection = await OAuthFlow.InitializeAsync(Api, $"/mcp/c/{id}", key);
+        using var onPlain = await OAuthFlow.InitializeAsync(Api, "/mcp", key);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, onConnection.StatusCode);
+        Assert.StartsWith(Challenge(id), RawWwwAuthenticate(onConnection), StringComparison.Ordinal);
+        Assert.Equal(HttpStatusCode.OK, onPlain.StatusCode);
+    }
+
+    [Fact]
+    public async Task Unknown_connection_urls_are_404()
+    {
+        using var unknown = await OAuthFlow.InitializeAsync(Api, "/mcp/c/abcdefghijklmnop", "kgt_at_" + new string('A', 43));
+        using var odd = await OAuthFlow.InitializeAsync(Api, "/mcp/c/not-an-id", bearer: null);
+
+        Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
+        Assert.False(unknown.Headers.Contains("WWW-Authenticate"));
+        Assert.Equal(HttpStatusCode.NotFound, odd.StatusCode);
     }
 
     [Fact]

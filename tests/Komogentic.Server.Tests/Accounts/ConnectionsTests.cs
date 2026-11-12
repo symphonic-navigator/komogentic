@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 using Komogentic.Server.Accounts;
+using Komogentic.Server.Komodo;
 using Komogentic.Server.OAuth;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Time.Testing;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -20,7 +22,15 @@ public sealed class ConnectionsTests(MongoFixture mongo)
     // Real "now": the stored times must read back as they were written.
     private readonly FakeTimeProvider _time = new(DateTimeOffset.UtcNow);
 
-    private Connections Connections => new(_db, _time);
+    // Creating and finding never call Komodo: a client that reaches nothing.
+    private Connections Connections
+    {
+        get
+        {
+            var komodo = new KomodoClient(new HttpClient { BaseAddress = new Uri("http://komodo.invalid/") });
+            return new(_db, komodo, new PendingDeletions(_db, komodo, _time, NullLogger<PendingDeletions>.Instance), _time, NullLogger<Connections>.Instance);
+        }
+    }
 
     [Fact]
     public async Task Creates_a_waiting_connection_with_a_url_shaped_id()

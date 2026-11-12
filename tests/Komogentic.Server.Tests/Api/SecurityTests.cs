@@ -102,12 +102,16 @@ public sealed class SecurityTests(AppFactory app)
     {
         // The session cookie opens nothing under /mcp.
         var session = await SessionAsync();
-        foreach (var path in new[] { "/mcp", "/MCP", "/mcp/anything", "/mcp/c/abcdefghijklmnop" })
+        foreach (var path in new[] { "/mcp", "/MCP", "/mcp/anything" })
         {
             using var response = await Api.SendAsync(HttpMethod.Post, path, new { jsonrpc = "2.0", id = 1, method = "tools/list" }, session: session);
             Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
             Assert.Equal("Bearer", response.Headers.WwwAuthenticate.ToString());
         }
+
+        // A connection's URL that no connection has is not found, with a session as without (Task 8a).
+        using var unknown = await Api.SendAsync(HttpMethod.Post, "/mcp/c/abcdefghijklmnop", new { jsonrpc = "2.0", id = 1, method = "tools/list" }, session: session);
+        Assert.Equal(HttpStatusCode.NotFound, unknown.StatusCode);
     }
 
     [Fact]

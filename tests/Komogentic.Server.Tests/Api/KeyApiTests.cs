@@ -275,7 +275,8 @@ public sealed class KeyApiTests : IDisposable
         using var request = McpRequest(secret, path: path);
         using var response = await Client().SendAsync(request, Ct);
 
-        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        // No connection has such a URL: not found, whatever the bearer (Task 8a; until then a 401).
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 
     [Fact]

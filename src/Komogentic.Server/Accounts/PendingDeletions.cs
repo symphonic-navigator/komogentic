@@ -114,7 +114,7 @@ public sealed class PendingDeletions(IMongoDatabase db, KomodoClient komodo, Tim
     }
 
     /// <summary>Creates the indexes once per process; lazy, so the server starts before MongoDB is reachable.</summary>
-    private async Task EnsureReadyAsync(CancellationToken ct)
+    internal async Task EnsureReadyAsync(CancellationToken ct)
     {
         if (_ready) return;
         var keys = Builders<PendingDeletionDocument>.IndexKeys;

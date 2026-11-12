@@ -79,6 +79,7 @@ builder.Services.AddClientMetadataFetcher();
 builder.Services.AddSingleton<OAuthClients>();
 builder.Services.AddSingleton<AuthorizationRequests>();
 builder.Services.AddSingleton<OAuthLimits>();
+builder.Services.AddSingleton<OAuthTokens>();
 
 // MCP over Streamable HTTP, stateless (the SDK's default): no Mcp-Session-Id, nothing kept between requests. The
 // collection-expression overload of WithTools: WithTools(typeof(X)) binds the params overload of another meaning and
@@ -138,7 +139,10 @@ app.MapDiscovery();
 app.MapOAuthEndpoints();
 app.MapSessionApi();
 app.MapKeyApi();
+app.MapConnectionApi();
 app.MapMcp("/mcp");
+// A connection's own URL (spec §5): the same tools, for its access tokens only (CallerMiddleware).
+app.MapMcp("/mcp/c/{id}");
 
 // An unknown /api or /mcp path is a JSON 404, never the web app. These are the more specific fallbacks, so they
 // win over the web app's; and they are not anonymous: CallerMiddleware still asks for a caller first.
