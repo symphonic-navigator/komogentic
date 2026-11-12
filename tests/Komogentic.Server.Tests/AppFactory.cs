@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using MongoDB.Driver;
+using Testcontainers.MongoDb;
+
+namespace Komogentic.Server.Tests;
+
+/// <summary>
+/// The real server in memory: Program.cs wiring and a MongoDB container (or the server in <c>KOMOGENTIC_TEST_MONGO</c>).
+/// </summary>
+public sealed class AppFactory : WebApplicationFactory<Program>, IAsyncLifetime
+{
+    private readonly MongoDbContainer? _mongo = TestImages.ExternalMongo is null ? TestImages.MongoContainer() : null;
+
+    public string MongoConnectionString => TestImages.ExternalMongo ?? _mongo!.GetConnectionString();
+
+    public string DatabaseName { get; } = "t" + Guid.NewGuid().ToString("N");
+
+    /// <summary>The app's database, for tests that look behind the server's back.</summary>
+    public IMongoDatabase Database => new MongoClient(MongoConnectionString).GetDatabase(DatabaseName);
+
+    public async ValueTask InitializeAsync()
+    {
+        if (_mongo is not null)
+        {
+            await _mongo.StartAsync();
+        }
+        else
+        {
+            await TestImages.EnsureReplicaSetAsync(MongoConnectionString, TestContext.Current.CancellationToken);
+        }
+    }
+
+    public override async ValueTask DisposeAsync()
+    {
+        await base.DisposeAsync();
+        if (_mongo is not null)
+        {
+            await _mongo.DisposeAsync();
+        }
+    }
+
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseSetting("Komogentic:Mongo:ConnectionString", MongoConnectionString);
+        builder.UseSetting("Komogentic:Mongo:Database", DatabaseName);
+    }
+}
+
+[CollectionDefinition("app")]
+public sealed class AppCollection : ICollectionFixture<AppFactory>;
