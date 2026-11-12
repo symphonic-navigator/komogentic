@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Komogentic and its MongoDB. `docker compose up -d` with a .env beside this file (.env.example lists every setting).
+# Behind Traefik: compose.traefik.yaml. Built from this checkout: compose.build.yaml (.envrc sets COMPOSE_FILE).
+
+services:
+  mongo:
+    image: ${KOMOGENTIC_MONGO_IMAGE:-mongo:8}
+    restart: unless-stopped
+    # A single-node replica set: Komogentic's token rotation and consent write several documents in one transaction.
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    hostname: mongo
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # Initiates the replica set on the first start, then reports whether it has a primary.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - |
+          try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) }
+          if (!db.hello().isWritablePrimary) quit(1);
+          quit(0);
+      interval: 5s
+      timeout: 10s
+      start_period: 30s
+      start_interval: 1s
+      retries: 10
+
+  komogentic:
+    image: ${KOMOGENTIC_IMAGE:-ghcr.io/symphonic-navigator/komogentic:latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${KOMOGENTIC_PORT:-8080}:8080"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      Komogentic__PublicUrl: ${KOMOGENTIC_PUBLIC_URL:-}
+      Komogentic__Komodo__Url: ${KOMOGENTIC_KOMODO_URL:?set KOMOGENTIC_KOMODO_URL in .env to the address Komogentic reaches Komodo Core at}
+      Komogentic__Komodo__TimeoutSeconds: ${KOMOGENTIC_KOMODO_TIMEOUT_SECONDS:-30}
+      Komogentic__Mongo__ConnectionString: mongodb://mongo:27017/?replicaSet=rs0
+      Komogentic__Mongo__Database: komogentic
+      Komogentic__OAuth__AccessTokenMinutes: ${KOMOGENTIC_OAUTH_ACCESS_TOKEN_MINUTES:-60}
+      Komogentic__Proxy__Trusted: ${KOMOGENTIC_TRUSTED_PROXY:-false}
+      Logging__LogLevel__Default: ${KOMOGENTIC_LOG_LEVEL:-Information}
+      TZ: ${TZ:-UTC}
+
+volumes:
+  mongo-data:

@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# The public shape: Komogentic behind Traefik, with a Let's Encrypt certificate.
+#
+#   docker compose -f compose.yaml -f compose.traefik.yaml up -d
+#
+# (or COMPOSE_FILE=compose.yaml:compose.traefik.yaml in .env, then plain `docker compose up -d`). Needs KOMOGENTIC_HOST in
+# .env, a DNS A record (and AAAA, if any) for it pointing at this host, and ports 80 and 443 free and reachable.
+#
+# What it changes against compose.yaml:
+# - Traefik is the only way in from outside the host: Komogentic's port is no longer published, Traefik listens on 80
+#   and 443, redirects http to https and terminates TLS. The certificate comes from Let's Encrypt through the TLS-ALPN
+#   challenge on port 443.
+# - Komogentic trusts the proxy (Komogentic:Proxy:Trusted): it takes the client address for its rate limits from the
+#   last X-Forwarded-For entry, the one Traefik appends, and the scheme from X-Forwarded-Proto, which Traefik sets.
+#   Traefik doesn't pass on the X-Forwarded-* headers a client sends (no forwardedHeaders.trustedIPs here), so a client
+#   can't pick its address. Komogentic trusts every peer the same way, though, so this holds only while Traefik is the
+#   one container on Komogentic's networks that takes requests from outside. Put no other container on its networks.
+# - Two networks: `proxy` (Traefik and Komogentic) and the default one (Komogentic and MongoDB), now internal. Traefik
+#   never sees MongoDB, and MongoDB has no way out. Komogentic reaches Komodo and the OAuth clients' metadata documents
+#   through `proxy`. To reach Komodo over an internal Docker network instead (preferred: the API secret travels in
+#   every request's headers), add that network to the komogentic service in a compose.override.yaml and point
+#   KOMOGENTIC_KOMODO_URL at Komodo Core's name on it.
+# - KOMOGENTIC_PUBLIC_URL is https://${KOMOGENTIC_HOST}; a KOMOGENTIC_PUBLIC_URL in .env is not used.
+#
+# Left as it is, on purpose: Strict-Transport-Security and the other security headers come from Komogentic itself
+# (with an https public URL, on every response), so Traefik adds none. Traefik keeps no access log (its default); if
+# you turn one on, keep query strings out of it: /oauth/authorize carries the client's state and PKCE challenge.
+#
+# Already running Traefik for other services? Then don't use this file: copy the komogentic service below (labels,
+# networks, `ports: !reset []`, the Komogentic__ settings) into a compose.override.yaml, declare `proxy` as your
+# Traefik's network with `external: true` and its `name:`, and use your entry point and certificate resolver names in
+# the labels. Every container on that shared network can then reach Komogentic on port 8080 directly and send its own
+# X-Forwarded-For, so give Komogentic a network of its own with Traefik where you can.
+
+services:
+  traefik:
+    image: ${KOMOGENTIC_TRAEFIK_IMAGE:-traefik:v3.7}
+    restart: unless-stopped
+    command:
+      - --global.checkNewVersion=false
+      - --global.sendAnonymousUsage=false
+      - --providers.docker=true
+      # Only containers labelled traefik.enable=true, reached over the proxy network.
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=komogentic-proxy
+      - --entryPoints.web.address=:80
+      - --entryPoints.web.http.redirections.entryPoint.to=websecure
+      - --entryPoints.web.http.redirections.entryPoint.scheme=https
+      - --entryPoints.websecure.address=:443
+      - --certificatesResolvers.letsencrypt.acme.tlsChallenge=true
+      # The HTTP challenge on port 80 works as well (in place of the line above), for instance where 443 is
+      # forwarded through something that terminates TLS itself:
+      # - --certificatesResolvers.letsencrypt.acme.httpChallenge.entryPoint=web
+      - --certificatesResolvers.letsencrypt.acme.email=${KOMOGENTIC_ACME_EMAIL:-}
+      - --certificatesResolvers.letsencrypt.acme.caServer=${KOMOGENTIC_ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      - --certificatesResolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Traefik reads the labels below through the Docker API. Read-only limits the mount, not the API: whoever
+      # controls Traefik controls Docker. A socket proxy that allows only reading containers narrows that.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - letsencrypt:/letsencrypt
+    networks:
+      - proxy
+
+  komogentic:
+    restart: unless-stopped
+    # No port on the host: Traefik is the only way in from outside it, which is what Komogentic__Proxy__Trusted relies on.
+    ports: !reset []
+    environment:
+      Komogentic__PublicUrl: https://${KOMOGENTIC_HOST:?set KOMOGENTIC_HOST in .env to the host name Komogentic is reached at}
+      Komogentic__Proxy__Trusted: "true"
+    networks:
+      - default
+      - proxy
+    labels:
+      - traefik.enable=true
+      # Everything on the host goes to Komogentic: the web app, /api, /mcp, /oauth and /.well-known.
+      - traefik.http.routers.komogentic.rule=Host(`${KOMOGENTIC_HOST}`)
+      - traefik.http.routers.komogentic.entrypoints=websecure
+      - traefik.http.routers.komogentic.tls.certresolver=letsencrypt
+      - traefik.http.services.komogentic.loadbalancer.server.port=8080
+
+  mongo:
+    restart: unless-stopped
+
+networks:
+  default:
+    # MongoDB and Komogentic only: no route out, and no other container on it.
+    internal: true
+  proxy:
+    name: komogentic-proxy
+    # Clients that come over IPv6 reach Traefik through Docker's userland proxy on a network without IPv6, so
+    # Traefik (and Komogentic's rate limits) see one Docker address for all of them. On a host with IPv6, turn it on:
+    # enable_ipv6: true
+
+volumes:
+  letsencrypt:

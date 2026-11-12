@@ -1,0 +1,4 @@
+services:
+  komogentic:
+    # Local development: build the image from this checkout instead of pulling the published one.
+    build: .
