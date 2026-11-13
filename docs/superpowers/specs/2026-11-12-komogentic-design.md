@@ -45,7 +45,7 @@ Building our own, small gateway was chosen over fixing that server upstream (dec
 ### The security boundary
 
 - **Everything is security-relevant**, because the gateway holds credentials that can change running software: the OAuth server (`/oauth/*`, the well-known documents), the caller middleware, the session and consent API, the sealing of Komodo secrets, the Komodo client's authentication, and the choice of which Komodo calls exist at all.
-- **What the gateway may call in Komodo** is a closed list: the read calls, `DeployStack`, `RestartStack` and `GetUpdate` from §4, plus the local login and creating and deleting the calling user's own API keys. No other Komodo request type appears in the code; a test enforces it (§8).
+- **What the gateway may call in Komodo** is a closed list: the read calls (`InspectImage` among them, added on 2026-11-13 by Chris, for the image versions of `get_stack_status`), `DeployStack`, `RestartStack` and `GetUpdate` from §4, plus the local login and creating and deleting the calling user's own API keys. No other Komodo request type appears in the code; a test enforces it (§8).
 - **Not touched:** Komodo itself, its users, permissions, variables and configuration; the host's reverse proxy; other applications' stacks beyond the tools in §4.
 
 ### How rights work
@@ -93,7 +93,7 @@ Six tools, stacks only (decided by Chris: deploy and restart, nothing destructiv
 | Tool | What it does | Komodo calls (to verify against 2.3.4) | Annotations |
 |---|---|---|---|
 | `list_stacks` | Every stack the user can see: name, server, state, the green/yellow/red verdict in one word. "Is everything green?" is this tool. | `ListStacks` | read-only |
-| `get_stack_status` | One stack: the verdict and why, per service: container state, health, image, update available. | `GetStack`, `ListStackServices` | read-only |
+| `get_stack_status` | One stack: the verdict and why, per service: container state, health, image, update available and the image the compose file names now. Best effort (decided by Chris, 2026-11-13): the image's short id, and its version from the `org.opencontainers.image.version` label, so that an agent can tell which build runs behind `:latest`. The version needs Read on the server (Komodo's rule for `InspectImage`), and is left out without it, for a Swarm stack, or when the label is missing or doesn't look like a version. | `GetStack`, `ListStackServices`, `InspectImage` per distinct image id | read-only |
 | `get_stack_logs` | Recent log lines of a stack, all services or chosen ones; `tail` (default 200, max 5000), timestamps; with `search` terms (and/or, case-insensitive), matching lines instead. | `GetStackLog`, `SearchStackLog` | read-only |
 | `list_stack_updates` | The last operations on a stack (default 10): operation (deploy, restart, …), who started it, start and end, success. With an update id, that update's logs. Answers "what was deployed when, and did it work?" | `ListUpdates` filtered by target, `GetUpdate` | read-only |
 | `deploy_stack` | Deploys a stack, or chosen services of it. Waits for Komodo's update to finish (up to a timeout, default 10 min), then returns success or failure with the relevant part of the update log, and the new verdict. | `DeployStack`, then `GetUpdate` until complete | not read-only, not destructive, not idempotent |

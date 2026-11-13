@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Globalization;
 using System.Text;
@@ -81,7 +82,8 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
 
     [McpServerTool(Name = "get_stack_status", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("One stack in detail: its verdict (green, yellow or red) and why, then each service's state, container status, " +
-                 "health, image and whether an update is available. Use it after list_stacks shows a stack that isn't green.")]
+                 "health, image and whether an update is available. Where Komodo knows them, the image's version and short id " +
+                 "show which build runs behind a tag such as :latest. Use it after list_stacks shows a stack that isn't green.")]
     public Task<CallToolResult> GetStackStatus(
         [Description("The stack's Komodo name (or id)")] string stack,
         CancellationToken ct = default) =>
@@ -92,6 +94,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 ?? throw new ToolFailure(ToolErrors.NoSuchStack(ToolErrors.Shown(stack)), "no such stack");
             var services = await komodo.ListStackServicesAsync(caller.Komodo, found.Name, ct);
             var (colour, why) = Verdict.OfStack(item, services, found.IgnoreServices);
+            var versions = await VersionsAsync(item, services, ct);
 
             var text = new StringBuilder($"{item.Name} — {Server(item)} — {item.Info.State} — {Verdict.Word(colour)}: {why}{UpdateNote(item)}");
             if (services.Count == 0) text.Append("\nKomodo lists no services for it.");
@@ -99,11 +102,14 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
             {
                 var (serviceColour, serviceWhy) = Verdict.OfService(service);
                 var status = service.Container?.Status is { Length: > 0 } s ? $" (\"{s}\")" : "";
-                var update = item.Info.Services.Any(u => u.Service == service.Service && u.UpdateAvailable) ? ", update available" : "";
+                var update = item.Info.Services.FirstOrDefault(u => u.Service == service.Service) is { } u
+                    ? (u.UpdateAvailable ? ", update available" : "")
+                      + (u.LatestImage is { Length: > 0 } latest && latest != service.Image ? $", the compose file now names {latest}" : "")
+                    : "";
                 var counted = Verdict.IsIgnored(service, found.IgnoreServices) ? "ignored (in the stack's ignore_services), not counted"
                     : Verdict.IsCompleted(service) ? "completed, not counted"
                     : $"{Verdict.Word(serviceColour)}: {serviceWhy}";
-                text.Append($"\n- {service.Service}: {service.State}{status}, health: {Health(service)}, image {service.Image}{update} — {counted}");
+                text.Append($"\n- {service.Service}: {service.State}{status}, health: {Health(service)}, image {service.Image}{ImageDetails(service, versions)}{update} — {counted}");
             }
 
             return Ok(text.ToString());
@@ -449,6 +455,46 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         return text.Length == 0 ? "(no logs)" : text.ToString().TrimEnd('\n');
     }
 
+    /// <summary>
+    /// Best effort: the version of each image the stack's containers run, by image id. InspectImage needs Read on the
+    /// server, which a user with rights on the stack alone lacks, so any failure only leaves the version out. A Swarm
+    /// stack's tasks run on nodes Komodo doesn't name here: there is no one server to ask.
+    /// </summary>
+    private async Task<IReadOnlyDictionary<string, string>> VersionsAsync(StackListItem stack, IReadOnlyList<StackService> services, CancellationToken ct)
+    {
+        var versions = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        if (stack.Info.SwarmId.Length > 0 || stack.Info.ServerId.Length == 0) return versions;
+        var ids = services.Select(s => s.Container?.ImageId).OfType<string>().Where(id => ShortImageId(id) is not null).Distinct(StringComparer.Ordinal);
+        await Parallel.ForEachAsync(ids, new ParallelOptions { MaxDegreeOfParallelism = MaxParallel, CancellationToken = ct }, async (id, t) =>
+        {
+            try
+            {
+                if (Version(await komodo.InspectImageVersionAsync(caller.Komodo, stack.Info.ServerId, id, t)) is { } version) versions[id] = version;
+            }
+            catch (KomodoException)
+            {
+            }
+        });
+        return versions;
+    }
+
+    /// <summary>" (version 1.2.3, id 0123456789ab)", either part only, or nothing.</summary>
+    private static string ImageDetails(StackService service, IReadOnlyDictionary<string, string> versions)
+    {
+        var id = service.Container?.ImageId;
+        var parts = new List<string>(2);
+        if (id is not null && versions.TryGetValue(id, out var version)) parts.Add($"version {version}");
+        if (ShortImageId(id) is { } shortId) parts.Add($"id {shortId}");
+        return parts.Count == 0 ? "" : $" ({string.Join(", ", parts)})";
+    }
+
+    /// <summary>Docker's short form, the first 12 hex digits of <c>sha256:…</c>; null for anything else.</summary>
+    private static string? ShortImageId(string? id) =>
+        id is not null && ImageId().IsMatch(id) ? id["sha256:".Length..("sha256:".Length + 12)] : null;
+
+    /// <summary>A label is whatever the image's author wrote: only a short, version-like one reaches the agent.</summary>
+    private static string? Version(string? label) => label?.Trim() is { } v && VersionText().IsMatch(v) ? v : null;
+
     private static string Outcome(string status, bool success) => status != "Complete" ? "in progress" : success ? "succeeded" : "failed";
 
     private static string Server(StackListItem stack) => stack.Info.SwarmId.Length > 0 ? $"swarm {stack.Info.SwarmName}" : stack.Info.ServerName;
@@ -526,6 +572,13 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
 
     [GeneratedRegex("^[A-Za-z0-9][A-Za-z0-9_.-]*$")]
     private static partial Regex ServiceName();
+
+    [GeneratedRegex("^sha256:[0-9a-f]{64}$")]
+    private static partial Regex ImageId();
+
+    // Semantic versions with pre-release and build parts, dates, "master", a commit hash.
+    [GeneratedRegex("^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")]
+    private static partial Regex VersionText();
 
     private sealed record ToolAnswer(string Text, bool IsError, string Outcome);
 }
