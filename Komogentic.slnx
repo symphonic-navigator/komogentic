@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Komogentic.Server/Komogentic.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Komogentic.Server.Tests/Komogentic.Server.Tests.csproj" />
+  </Folder>
+</Solution>

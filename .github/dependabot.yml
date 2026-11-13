@@ -1,0 +1,44 @@
+# Keeps what the build pulls in up to date, each pinned where it is used: the actions to commit hashes in the
+# workflows, the base images to digests in the Dockerfile, the NuGet packages to the versions in the project files
+# and packages.lock.json, the web app's npm packages to its pnpm-lock.yaml. And the images the Compose files run, by
+# the tags in the defaults of KOMOGENTIC_MONGO_IMAGE and KOMOGENTIC_TRAEFIK_IMAGE (`${…:-image:tag}`), whose tags name
+# a major or minor version only, so a pull request there is a new major or minor version: review it.
+#
+# Node only on its LTS lines, the even majors: an odd major is never LTS and is out of support within months.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: node
+        versions: ["27.x", "29.x", "31.x", "33.x"]
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: nuget
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Minor and patch updates of the web app's packages come as one pull request a week, a major one on its own.
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    groups:
+      web:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      - dependency-name: "@types/node"
+        versions: ["27.x", "29.x", "31.x", "33.x"]

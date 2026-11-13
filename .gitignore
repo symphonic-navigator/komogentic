@@ -1,0 +1,29 @@
+# .NET
+bin/
+obj/
+TestResults/
+*.user
+
+# Web app
+node_modules/
+web/dist/
+*.tsbuildinfo
+# A local build's copy of the web app; the image builds its own.
+src/Komogentic.Server/wwwroot/
+
+# Deployment-specific settings stay out of the repository.
+.env
+compose.override.yaml
+
+# Tools
+.claude/worktrees/
+.superpowers/
+.idea/
+.vscode/
+
+# Obsidian's state, not its settings
+obsidian/.obsidian/workspace.json
+obsidian/.obsidian/workspace-mobile.json
+obsidian/.obsidian/workspace*.json
+obsidian/.obsidian/cache
+obsidian/.trash/
