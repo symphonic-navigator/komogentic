@@ -223,7 +223,8 @@ public sealed partial class AntiGoalTests(AppFactory app) : IDisposable
         await ErrorAsync(client, "get_stack_logs", new { stack = readOnly.Name, search = new[] { "x" } });
         await ErrorAsync(client, "get_stack_logs", new { stack = swarm.Name });
         await OkAsync(client, "get_stack_logs", new { stack = swarm.Name, services = new[] { "web" } });
-        await OkAsync(client, "get_stack_logs", new { stack = swarm.Name, services = new[] { "web" }, search = new[] { "swarm" } });
+        // Komodo 2.3.4 can't search a Swarm service's logs: refused before any Komodo call.
+        await ErrorAsync(client, "get_stack_logs", new { stack = swarm.Name, services = new[] { "web" }, search = new[] { "swarm" } });
         await ErrorAsync(client, "get_stack_logs", new { stack = hidden.Name });
 
         await OkAsync(client, "list_stack_updates", new { stack = run.Name });
