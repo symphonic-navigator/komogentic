@@ -2,6 +2,13 @@
 
 What changed for the people who use and run Komogentic, per release.
 
+## 0.1.1 (unreleased)
+
+### Fixed
+
+- **`get_stack_status` no longer shows a base image's version as the image's own.** `mongo:8` showed "version 24.04", Ubuntu's. A version now counts only when the image also names its source or revision, as images from a build pipeline do.
+- **`get_stack_status` no longer names a compose file's image with variables in it** ("the compose file now names `${APP_IMAGE:-…}`"): Komodo gives the file's text unresolved, which is no image.
+
 ## 0.1.0 (2026-11-13)
 
 The first version.
