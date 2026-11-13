@@ -41,8 +41,8 @@ public static class SessionApi
     }
 
     private static async Task<Ok<SessionView>> SignInAsync(
-        SignInRequest body, HttpContext http, KomodoClient komodo, Sessions sessions, PendingDeletions deletions, SignInLimiter limiter, TimeProvider time,
-        ILoggerFactory logs, CancellationToken ct)
+        SignInRequest body, HttpContext http, KomodoClient komodo, Sessions sessions, PendingDeletions deletions, ApiKeys apiKeys, Connections connections,
+        SignInLimiter limiter, TimeProvider time, ILoggerFactory logs, CancellationToken ct)
     {
         var log = logs.CreateLogger(typeof(SessionApi).FullName!);
         if (limiter.Attempt(http, body.Username) is { } retryAfter) throw ApiErrors.TooMany(retryAfter, "Too many sign-in attempts; try again in a minute.");
@@ -81,7 +81,9 @@ public static class SessionApi
         var resolved = await sessions.ResolveAsync(secret, ct) ?? throw new InvalidOperationException("A session just started does not resolve");
         log.LogInformation("User {UserId} signed in", user.Id);
 
-        // Keys of revoked or dead credentials, now that a JWT is at hand. Komodo's failures never fail the sign-in.
+        // Keys of revoked, dead or expired credentials, now that a JWT is at hand. Komodo's failures never fail the sign-in.
+        await apiKeys.QueueExpiredAsync(user.Id, ct);
+        await connections.QueueExpiredAsync(user.Id, ct);
         await deletions.DrainAsync(user.Id, new KomodoAuth.Jwt(jwt), ct);
 
         var options = CookieOptions();

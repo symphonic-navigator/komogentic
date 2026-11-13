@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 using System.Buffers.Text;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using Komogentic.Server.Accounts;
 using Komogentic.Server.Api;
 using Komogentic.Server.Auth;
 using Komogentic.Server.Komodo;
 using Komogentic.Server.Tests.Komodo;
+using Komogentic.Server.Tests.OAuth;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -60,6 +62,7 @@ public sealed class SessionTests : IDisposable
         _app.Komodo.Down = false;
         _app.Komodo.RateLimited = false;
         _app.Komodo.JwtLifetime = TimeSpan.FromDays(1);
+        _app.Komodo.Time = TimeProvider.System;
         _app.Komodo.ClearFailures();
     }
 
@@ -255,22 +258,42 @@ public sealed class SessionTests : IDisposable
     [Fact]
     public async Task Sign_in_is_rate_limited_per_address()
     {
+        // Komodo locks its local login out after 5 failures in 15 s from one address, and it sees only Komogentic's:
+        // the fifth attempt within 15 s from one address never reaches it.
         var address = Dashboard.NewAddress();
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 4; i++)
         {
             using var attempt = await _api.PostSessionAsync($"nobody-{i}-{Guid.NewGuid():N}", "wrong", address);
             Assert.Equal(HttpStatusCode.Unauthorized, attempt.StatusCode);
         }
 
         var before = _app.Komodo.Requests.Count;
-        using var sixth = await _api.PostSessionAsync("anna", AnnaPassword, address);
+        using var fifth = await _api.PostSessionAsync("anna", AnnaPassword, address);
 
-        Assert.Equal(HttpStatusCode.TooManyRequests, sixth.StatusCode);
-        Assert.True(sixth.Headers.RetryAfter?.Delta > TimeSpan.Zero);
-        Assert.Null(Dashboard.SetCookie(sixth));
+        Assert.Equal(HttpStatusCode.TooManyRequests, fifth.StatusCode);
+        Assert.True(fifth.Headers.RetryAfter?.Delta > TimeSpan.Zero);
+        Assert.Null(Dashboard.SetCookie(fifth));
         Assert.Equal(before, _app.Komodo.Requests.Count);
         using var elsewhere = await _api.PostSessionAsync("anna", AnnaPassword);
         Assert.Equal(HttpStatusCode.OK, elsewhere.StatusCode);
+    }
+
+    [Fact]
+    public async Task Ipv6_addresses_of_one_48_share_the_sign_in_budget()
+    {
+        // One /48 is what a provider hands a site: 65,536 /64s of one attacker count as one address.
+        var network = $"2001:db8:{RandomNumberGenerator.GetInt32(1, 0xffff):x}";
+        for (var i = 0; i < 4; i++)
+        {
+            using var attempt = await _api.PostSessionAsync($"nobody-{i}-{Guid.NewGuid():N}", "wrong", $"{network}:{i + 1:x}::1");
+            Assert.Equal(HttpStatusCode.Unauthorized, attempt.StatusCode);
+        }
+
+        var before = _app.Komodo.Requests.Count;
+        using var fifth = await _api.PostSessionAsync("anna", AnnaPassword, $"{network}:ffff::1");
+
+        Assert.Equal(HttpStatusCode.TooManyRequests, fifth.StatusCode);
+        Assert.Equal(before, _app.Komodo.Requests.Count);
     }
 
     [Fact]
@@ -317,6 +340,50 @@ public sealed class SessionTests : IDisposable
 
         Assert.True(_app.Komodo.ApiKeys.Single(k => k.Key == later.Key).Deleted);
         Assert.Empty(await PendingKeysAsync());
+    }
+
+    [Fact]
+    public async Task Sign_in_deletes_the_komodo_key_of_an_expired_api_key_once()
+    {
+        _app.Komodo.Time = _time;
+        var owner = await Owner.NewAsync(_app, _api);
+        var (info, _) = await _api.Services.GetRequiredService<ApiKeys>()
+            .CreateAsync(owner.User, new KomodoAuth.Jwt(_app.Komodo.IssueJwt(owner.UserId)), "Hermes", 30, Ct);
+        var komodoKey = _app.Komodo.ApiKeys.Single(k => k.UserId == owner.UserId).Key;
+
+        _time.Advance(TimeSpan.FromDays(31));
+        await owner.SignInAgainAsync(_api);
+
+        Assert.True(_app.Komodo.ApiKeys.Single(k => k.Key == komodoKey).Deleted);
+        Assert.Single(_app.Komodo.Requests, r => r.Type == "DeleteApiKey" && r.Params.GetProperty("key").GetString() == komodoKey);
+        Assert.Empty(await PendingKeysAsync(owner.UserId));
+        // Queued once: the next sign-in leaves it alone.
+        await owner.SignInAgainAsync(_api);
+        Assert.Single(_app.Komodo.Requests, r => r.Type == "DeleteApiKey" && r.Params.GetProperty("key").GetString() == komodoKey);
+        var listed = Assert.Single(await _api.Services.GetRequiredService<ApiKeys>().ListAsync(owner.UserId, Ct));
+        Assert.Equal((info.Id, ApiKeyState.Expired), (listed.Id, listed.State));
+    }
+
+    [Fact]
+    public async Task Sign_in_deletes_the_komodo_key_of_an_expired_connection_once()
+    {
+        _app.Komodo.Time = _time;
+        var flow = await OAuthFlow.NewAsync(_app, _api, expiresInDays: 30);
+        await flow.AllowAsync();
+        await flow.ExchangeAsync();
+        var connection = await _app.Database.GetCollection<BsonDocument>("connections").Find(new BsonDocument("_id", flow.ConnectionId)).SingleAsync(Ct);
+        var komodoKey = connection["komodoKey"].AsString;
+
+        _time.Advance(TimeSpan.FromDays(31));
+        await flow.Owner.SignInAgainAsync(_api);
+
+        Assert.True(_app.Komodo.ApiKeys.Single(k => k.Key == komodoKey).Deleted);
+        Assert.Single(_app.Komodo.Requests, r => r.Type == "DeleteApiKey" && r.Params.GetProperty("key").GetString() == komodoKey);
+        Assert.Empty(await PendingKeysAsync(flow.Owner.UserId));
+        await flow.Owner.SignInAgainAsync(_api);
+        Assert.Single(_app.Komodo.Requests, r => r.Type == "DeleteApiKey" && r.Params.GetProperty("key").GetString() == komodoKey);
+        var listed = Assert.Single(await _api.Services.GetRequiredService<Connections>().ListAsync(flow.Owner.UserId, Ct));
+        Assert.Equal(ConnectionState.Expired, listed.State);
     }
 
     [Fact]
@@ -449,8 +516,8 @@ public sealed class SessionTests : IDisposable
         }
     }
 
-    private async Task<List<string>> PendingKeysAsync() =>
-        (await _app.Database.GetCollection<BsonDocument>("pending_deletions").Find(Builders<BsonDocument>.Filter.Eq("user", AnnaId)).ToListAsync(Ct))
+    private async Task<List<string>> PendingKeysAsync(string userId = AnnaId) =>
+        (await _app.Database.GetCollection<BsonDocument>("pending_deletions").Find(Builders<BsonDocument>.Filter.Eq("user", userId)).ToListAsync(Ct))
             .Select(d => d["komodoKey"].AsString).ToList();
 
     private static bool Contains(byte[] haystack, byte[] needle) => haystack.AsSpan().IndexOf(needle) >= 0;

@@ -29,12 +29,41 @@ test("shows the client and connection and allows", async () => {
   renderWith(<App />, "/consent?request=r1");
 
   expect(await screen.findByText(/wants to use your connection/)).toHaveTextContent(
-    "Grok wants to use your connection Grok assistant: your Komodo stacks with your rights.",
+    "Grok (grok.com) wants to use your connection Grok assistant: your Komodo stacks with your rights.",
   );
   await userEvent.click(screen.getByRole("button", { name: "Allow" }));
 
   expect(calls.find((c) => c.method === "POST")?.body).toEqual({ allow: true });
   await vi.waitFor(() => expect(window.location.assign).toHaveBeenCalledWith("https://grok.com/callback?code=x&iss=y"));
+});
+
+test("shows a metadata client's host next to the name it gives itself", async () => {
+  const claude: ConsentView = { ...view, client: { name: "Claude", host: "evil.example", verified: true }, redirectHost: "evil.example" };
+  fakeApi({ ...session, "GET /api/oauth/requests/r1": () => ({ status: 200, json: claude }) });
+  renderWith(<App />, "/consent?request=r1");
+
+  expect(await screen.findByText(/wants to use your connection/)).toHaveTextContent("Claude (evil.example) wants to use your connection");
+  const meta = screen.getByText(/names itself/);
+  expect(meta).toHaveTextContent("The app names itself “Claude”; what Komogentic can vouch for is its address, evil.example.");
+  expect(meta).not.toHaveTextContent(/registered itself/);
+});
+
+test("shows a registered client's host and that it is only where it returns to", async () => {
+  const hermes: ConsentView = { ...view, client: { name: "Hermes", host: "hermes.example", verified: false }, redirectHost: "hermes.example" };
+  fakeApi({ ...session, "GET /api/oauth/requests/r1": () => ({ status: 200, json: hermes }) });
+  renderWith(<App />, "/consent?request=r1");
+
+  expect(await screen.findByText(/wants to use your connection/)).toHaveTextContent("Hermes (hermes.example) wants to use your connection");
+  const meta = screen.getByText(/names itself/);
+  expect(meta).toHaveTextContent("The app names itself “Hermes”; what Komogentic can vouch for is its address, hermes.example.");
+  expect(meta).toHaveTextContent("It registered itself, so that address is only the one it returns to.");
+});
+
+test("shows the host of an app asking for an address that isn't a connection", async () => {
+  fakeApi({ ...session, "GET /api/oauth/requests/r1": () => ({ status: 200, json: { ...view, connection: null, problem: "not_a_connection" } }) });
+  renderWith(<App />, "/consent?request=r1");
+
+  expect(await screen.findByText(/wants to connect/)).toHaveTextContent("Grok (grok.com) wants to connect.");
 });
 
 test("denies", async () => {

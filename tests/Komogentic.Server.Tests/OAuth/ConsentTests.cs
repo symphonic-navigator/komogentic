@@ -138,6 +138,22 @@ public sealed class ConsentTests(AppFactory app) : IDisposable
     }
 
     [Fact]
+    public async Task A_homograph_host_is_shown_in_its_punycode_form()
+    {
+        // "claudе.ai" with a Cyrillic е: in Unicode it reads as claude.ai.
+        const string redirect = "https://claud\u0435.ai/cb";
+        var owner = await Owner.NewAsync(app, Api);
+        var connectionId = await OAuthFlow.ConnectionAsync(Api, owner);
+        var flow = await OAuthFlow.StartAsync(Api, owner, connectionId, await OAuthFlow.RegisterAsync(Api, redirect, name: ""), redirect);
+
+        var view = await flow.ConsentAsync();
+
+        Assert.Equal("xn--claud-3we.ai", view.GetProperty("client").GetProperty("host").GetString());
+        Assert.Equal("xn--claud-3we.ai", view.GetProperty("client").GetProperty("name").GetString());
+        Assert.Equal("xn--claud-3we.ai", view.GetProperty("redirectHost").GetString());
+    }
+
+    [Fact]
     public async Task A_second_consent_is_a_renewal()
     {
         var first = await FlowAsync();

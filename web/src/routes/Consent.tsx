@@ -48,23 +48,28 @@ function Decision({ id }: { id: string }) {
   }
 
   const view = consent.data;
+  const { client } = view;
+  // The name is the app's own choice, verified or not (a metadata document only proves where it came from): the host
+  // goes next to it, always, so that an app calling itself "Claude" from elsewhere shows where it is from.
   return (
     <>
       {view.connection ? (
         <p className="ask">
-          <strong>{view.client.name}</strong> wants to use your connection <strong>{view.connection.name}</strong>: your Komodo stacks with your rights
+          <strong>{client.name}</strong> ({client.host}) wants to use your connection <strong>{view.connection.name}</strong>: your Komodo stacks with your rights
           {view.readOnly ? ", read only (no deploy or restart)" : ""}.
         </p>
       ) : (
         <p className="ask">
-          <strong>{view.client.name}</strong> wants to connect.
+          <strong>{client.name}</strong> ({client.host}) wants to connect.
         </p>
       )}
       <p className="meta">
-        You return to {view.redirectHost} afterwards.
-        {!view.client.verified && ` The app named itself “${view.client.name}”; Komogentic could not check that name.`}
+        The app names itself “{client.name}”; what Komogentic can vouch for is its address, {client.host}.
+        {!client.verified && " It registered itself, so that address is only the one it returns to."}
+        {` You return to ${view.redirectHost} afterwards.`}
         {view.connection && ` The connection expires ${dateText(view.connection.expiresAt)}.`}
-        {view.connection?.currentClient && ` It is now used by ${view.connection.currentClient.name}; allowing replaces that.`}
+        {view.connection?.currentClient &&
+          ` It is now used by ${view.connection.currentClient.name} (${view.connection.currentClient.host}); allowing replaces that.`}
       </p>
       {view.problem && <p role="alert" className="error">{problems[view.problem]}</p>}
       {decide.isError && <p role="alert" className="error">{errorText(decide.error)}</p>}

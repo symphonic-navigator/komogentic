@@ -22,7 +22,8 @@ public sealed record CreateConnectionRequest(string Name, int? ExpiresInDays = n
 
 /// <summary>
 /// What the consent page shows for a pending authorisation. <c>client</c>: the app asking; <c>redirectHost</c>: where
-/// the browser returns. <c>connection</c>: the connection its URL names; null when the address is no connection's.
+/// the browser returns, in its IDN (punycode) form like the client's host. <c>connection</c>: the connection its URL
+/// names; null when the address is no connection's.
 /// <c>readOnly</c>: the app asked for <c>komodo:read</c> alone, so the grant gets the read tools only.
 /// <c>renewal</c>: the connection was authorised before. <c>problem</c>: null, <c>not_a_connection</c>, <c>revoked</c>
 /// or <c>expired</c>; with a problem only Deny is possible. A request for another account's connection is a 404 to this
@@ -118,7 +119,7 @@ public static class ConnectionApi
         if (client is null) throw ApiErrors.NotFound(ClientGone);
         var (problem, connection, renewal) = await ConsentConnectionAsync(request, connections, time, ct);
         return TypedResults.Ok(new ConsentView(
-            request.Id, new ConnectedClient(client.Name, client.Host, client.Verified), new Uri(request.RedirectUri).Host, connection, request.ReadOnly, renewal, problem));
+            request.Id, new ConnectedClient(client.Name, client.Host, client.Verified), new Uri(request.RedirectUri).IdnHost, connection, request.ReadOnly, renewal, problem));
     }
 
     /// <summary>

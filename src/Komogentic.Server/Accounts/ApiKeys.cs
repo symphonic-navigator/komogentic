@@ -33,7 +33,7 @@ public sealed record ResolvedApiKey(string Id, KomodoUser User, string Name, Kom
 /// each a Komodo API key of its user, created with the session's JWT when the key is (spec §2, "How rights work"). The
 /// Komodo key's secret is sealed under the API key (collection <c>api_keys</c>), which only the agent holds: the server
 /// keeps its HKDF lookup, never the key itself. A revoked or dead key's Komodo key is deleted with a JWT, at once or
-/// with the user's next one (<see cref="PendingDeletions"/>).
+/// with the user's next one (<see cref="PendingDeletions"/>); an expired key's with the user's next sign-in.
 /// </summary>
 public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDeletions pending, TimeProvider time, ILogger<ApiKeys> log)
 {
@@ -211,6 +211,25 @@ public sealed class ApiKeys(IMongoDatabase db, KomodoClient komodo, PendingDelet
     }
 
     /// <summary>
+    /// Queues the Komodo keys of the user's keys that have expired, neither revoked nor dead (those were queued then),
+    /// for deletion (reason <c>expired</c>), each once: a key queued is marked so. Called at sign-in, before the queue is
+    /// drained with the new JWT.
+    /// </summary>
+    public async Task QueueExpiredAsync(string userId, CancellationToken ct)
+    {
+        await EnsureReadyAsync(ct);
+        var now = Now;
+        var expired = await Docs.Find(k => k.User == userId && k.ExpiresAt <= now && k.RevokedAt == null && k.DeadAt == null && k.ExpiredQueuedAt == null)
+            .ToListAsync(ct);
+        foreach (var doc in expired)
+        {
+            // Queued before it is marked: a failure in between queues it again next time, which only updates its time.
+            await pending.AddAsync(null, userId, doc.KomodoKey, "expired", ct);
+            await Docs.UpdateOneAsync(k => k.Id == doc.Id, Builders<ApiKeyDocument>.Update.Set(k => k.ExpiredQueuedAt, CredentialRules.Milliseconds(now)), cancellationToken: ct);
+        }
+    }
+
+    /// <summary>
     /// Deletes a Komodo key nobody will use again with <paramref name="jwt"/>, else queues it for the user's next JWT.
     /// Never fails over Komodo, except that with <paramref name="rethrowUnauthorized"/> Komodo refusing the JWT is
     /// thrown, once the key is queued, so that the session ends.
@@ -334,6 +353,10 @@ public sealed class ApiKeyDocument
     /// <summary>Why the key is dead: <c>komodo_key_rejected</c>, <c>unreadable</c>.</summary>
     [BsonElement("reason"), BsonIgnoreIfNull]
     public string? Reason { get; set; }
+
+    /// <summary>When its Komodo key was queued for deletion because the key had expired.</summary>
+    [BsonElement("expiredQueuedAt"), BsonIgnoreIfNull]
+    public DateTime? ExpiredQueuedAt { get; set; }
 }
 
 public sealed class ApiKeyNameTakenException(string name) : CredentialNameTakenException($"You already have an API key named '{name}'.");

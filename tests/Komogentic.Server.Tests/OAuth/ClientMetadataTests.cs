@@ -128,6 +128,26 @@ public sealed class ClientMetadataTests
     }
 
     [Fact]
+    public async Task A_homograph_host_is_shown_in_its_punycode_form()
+    {
+        // "claudе.ai" with a Cyrillic е: in Unicode it reads as claude.ai.
+        const string clientId = "https://claud\u0435.ai/client.json";
+        var handler = new AnsweringHandler($$"""{"client_id":"{{clientId}}","client_name":"Claude","redirect_uris":["https://claude.ai/cb"]}""");
+
+        var result = await Fetcher(handler: handler).FetchAsync(clientId, Ct);
+
+        Assert.Null(result.Error);
+        Assert.Equal("xn--claud-3we.ai", result.Client!.Host);
+    }
+
+    /// <summary>Answers every request with <paramref name="json"/>.</summary>
+    private sealed class AnsweringHandler(string json) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json") });
+    }
+
+    [Fact]
     public async Task Cleans_the_name()
     {
         await using var server = await ServerAsync(id => new MetadataResponse(

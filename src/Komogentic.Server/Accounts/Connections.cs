@@ -236,6 +236,26 @@ public sealed class Connections(IMongoDatabase db, KomodoClient komodo, PendingD
         if (user is not null) log.LogWarning("Connection {ConnectionId} of user {UserId} needs a reconnect: Komodo rejected its Komodo key", id, user);
     }
 
+    /// <summary>
+    /// Queues the Komodo keys of the user's connections that have expired, unrevoked (a revoke deleted or queued its key),
+    /// for deletion (reason <c>expired</c>), each once: a connection whose key is queued is marked so. Called at sign-in,
+    /// before the queue is drained with the new JWT.
+    /// </summary>
+    public async Task QueueExpiredAsync(string userId, CancellationToken ct)
+    {
+        await EnsureReadyAsync(ct);
+        var now = Now;
+        var expired = await Docs.Find(c => c.User == userId && c.ExpiresAt <= now && c.RevokedAt == null && c.KomodoKey != null && c.ExpiredQueuedAt == null)
+            .ToListAsync(ct);
+        foreach (var doc in expired)
+        {
+            // Queued before it is marked: a failure in between queues it again next time, which only updates its time.
+            await pending.AddAsync(null, userId, doc.KomodoKey!, ConnectionReasons.Expired, ct);
+            await Docs.UpdateOneAsync(
+                c => c.Id == doc.Id, Builders<ConnectionDocument>.Update.Set(c => c.ExpiredQueuedAt, CredentialRules.Milliseconds(now)), cancellationToken: ct);
+        }
+    }
+
     /// <summary>10 random bytes in lower-case Base32 without padding: 16 characters.</summary>
     public static string NewId()
     {
@@ -334,6 +354,10 @@ public sealed class ConnectionDocument
 
     [BsonElement("tokensRevokedReason"), BsonIgnoreIfNull]
     public string? TokensRevokedReason { get; set; }
+
+    /// <summary>When its Komodo key was queued for deletion because the connection had expired.</summary>
+    [BsonElement("expiredQueuedAt"), BsonIgnoreIfNull]
+    public DateTime? ExpiredQueuedAt { get; set; }
 
     /// <summary>How many times the Komodo secret was sealed for its codes and tokens. Incremented in every issuing
     /// transaction, a write that always changes the document, so that issuing conflicts with a revocation.</summary>

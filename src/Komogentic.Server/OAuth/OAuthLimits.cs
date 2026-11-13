@@ -5,10 +5,11 @@ using Komogentic.Server.Auth;
 namespace Komogentic.Server.OAuth;
 
 /// <summary>
-/// The OAuth endpoints' rate limits, in memory like <see cref="WrongKeyLimiter"/>: registrations per network,
-/// metadata document fetches per address and per host, failed token requests per client id and network together.
+/// The OAuth endpoints' rate limits, in memory like <see cref="WrongKeyLimiter"/>: registrations per address, metadata
+/// document fetches per address and per host, failed token requests per client id and address together. An address is
+/// counted as <see cref="WrongKeyLimiter.Partition"/> does: IPv4 by the address, IPv6 by its /64.
 /// Not per client id alone: anyone can name claude.ai's client id, and 20 bogus requests would then stop every real claude.ai exchange for a minute. Not per
-/// network alone either: Anthropic's connectors all come from one egress range, so its users would share
+/// address alone either: Anthropic's connectors all come from one egress range, so its users would share
 /// one budget with every other client calling from there.
 /// </summary>
 public sealed class OAuthLimits : IDisposable
@@ -62,7 +63,7 @@ public sealed class OAuthLimits : IDisposable
     public TimeSpan? MetadataFetch(HttpContext http, string host) =>
         Take(_metadataFetchByAddress, WrongKeyLimiter.Partition(http.Connection.RemoteIpAddress)) ?? Take(_metadataFetchByHost, host.ToLowerInvariant());
 
-    /// <summary>Null if a token request for the client from this caller's network may be checked (a permit is then held
+    /// <summary>Null if a token request for the client from this caller's address may be checked (a permit is then held
     /// until <see cref="TokenFailed"/> or <see cref="TokenRelease"/>); else how long to wait.</summary>
     public TimeSpan? TokenReserve(HttpContext http, string clientId) => _tokens.TryReserve(Key(http, clientId));
 
@@ -70,7 +71,7 @@ public sealed class OAuthLimits : IDisposable
 
     public void TokenRelease(HttpContext http, string clientId) => _tokens.Release(Key(http, clientId));
 
-    /// <summary>The network (<see cref="WrongKeyLimiter.Partition"/>, IPv6 per /64) and the client id, cut to <see cref="MaxClientIdKey"/>.</summary>
+    /// <summary>The address (<see cref="WrongKeyLimiter.Partition"/>: IPv4 by the address, IPv6 by its /64) and the client id, cut to <see cref="MaxClientIdKey"/>.</summary>
     private static string Key(HttpContext http, string clientId) =>
         WrongKeyLimiter.Partition(http.Connection.RemoteIpAddress) + " " + (clientId.Length <= MaxClientIdKey ? clientId : clientId[..MaxClientIdKey]);
 

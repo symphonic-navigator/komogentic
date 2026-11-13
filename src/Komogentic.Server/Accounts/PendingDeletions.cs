@@ -7,7 +7,7 @@ using MongoDB.Driver;
 namespace Komogentic.Server.Accounts;
 
 /// <summary>
-/// Komodo API keys that Komogentic created for a user and no longer uses (a revoked or dead API key or connection, a
+/// Komodo API keys that Komogentic created for a user and no longer uses (a revoked, dead or expired API key or connection, a
 /// replaced connection key, a code never exchanged), waiting to be deleted in Komodo (spec §5). Deleting one needs the
 /// user's JWT, which only a sign-in or a consent brings, so they wait in <c>pending_deletions</c> until then. Until it
 /// is deleted such a key is useless (nobody holds its secret) and recognisable by its <c>komogentic/</c> name prefix.
@@ -155,7 +155,7 @@ public sealed class PendingDeletionDocument
     [BsonElement("komodoKey")]
     public string KomodoKey { get; set; } = "";
 
-    /// <summary>Why it is no longer used: <c>revoked</c>, <c>dead</c>, <c>replaced</c>, <c>code_unused</c>, …</summary>
+    /// <summary>Why it is no longer used: <c>revoked</c>, <c>dead</c>, <c>expired</c>, <c>replaced</c>, <c>code_unused</c>, …</summary>
     [BsonElement("reason")]
     public string Reason { get; set; } = "";
 

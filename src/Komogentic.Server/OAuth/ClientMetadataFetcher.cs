@@ -10,7 +10,9 @@ using Microsoft.Extensions.Options;
 namespace Komogentic.Server.OAuth;
 
 /// <summary>A client as the authorisation page shows it. CIMD: <see cref="Host"/> is the host of the <c>client_id</c> URL
-/// and <see cref="Verified"/> is true; DCR: the host of the first redirect URI, not verified.</summary>
+/// and <see cref="Verified"/> is true; DCR: the host of the first redirect URI, not verified. Verified says only that the
+/// document came from that host; the name is the client's own choice either way. The host is in its IDN (punycode) form,
+/// so that a look-alike such as <c>claudе.ai</c> with a Cyrillic е shows as what it is.</summary>
 public sealed record OAuthClient(string ClientId, string Name, string Host, IReadOnlyList<string> RedirectUris, bool Verified);
 
 /// <summary><paramref name="Error"/> is one of <c>unreachable</c>, <c>not_public</c>, <c>too_large</c>, <c>not_json</c>,
@@ -164,9 +166,9 @@ public sealed class ClientMetadataFetcher(IHttpClientFactory http, IOptions<Komo
             var body = await ReadCappedAsync(await response.Content.ReadAsStreamAsync(timeout.Token), timeout.Token);
             if (body is null) return (Fail(clientId, "too_large"), default);
 
-            var parsed = Parse(clientId, url.Host, body);
+            var parsed = Parse(clientId, url.IdnHost, body);
             if (parsed.Error is not null) return (Fail(clientId, parsed.Error), default);
-            log.LogInformation("Client metadata of {Host} accepted", url.Host);
+            log.LogInformation("Client metadata of {Host} accepted", url.IdnHost);
             var maxAge = response.Headers.CacheControl?.MaxAge ?? DefaultAge;
             return (parsed, Clamp(maxAge));
         }
@@ -185,7 +187,7 @@ public sealed class ClientMetadataFetcher(IHttpClientFactory http, IOptions<Komo
         catch (Exception e) when (e is HttpRequestException or IOException)
         {
             // The type only: a message could carry the address or part of the response.
-            log.LogInformation("Client metadata of {Host} unreachable ({Type})", url.Host, e.GetType().Name);
+            log.LogInformation("Client metadata of {Host} unreachable ({Type})", url.IdnHost, e.GetType().Name);
             return (new ClientMetadataResult(null, "unreachable"), default);
         }
     }
@@ -193,7 +195,7 @@ public sealed class ClientMetadataFetcher(IHttpClientFactory http, IOptions<Komo
     private ClientMetadataResult Fail(string clientId, string error)
     {
         // Only the host and the reason: the document and the rest of the URL are the client's to choose.
-        var host = Uri.TryCreate(clientId, UriKind.Absolute, out var uri) ? uri.Host : "(not a URL)";
+        var host = Uri.TryCreate(clientId, UriKind.Absolute, out var uri) ? uri.IdnHost : "(not a URL)";
         log.LogInformation("Client metadata of {Host} refused: {Error}", host, error);
         return new ClientMetadataResult(null, error);
     }

@@ -144,7 +144,7 @@ public sealed class OAuthClients(IMongoDatabase db, ClientMetadataFetcher fetche
         return redirects;
     }
 
-    private static string HostOf(string redirectUri) => new Uri(redirectUri).Host;
+    private static string HostOf(string redirectUri) => new Uri(redirectUri).IdnHost;
 
     private static bool IsRegisteredId(string id) =>
         id.Length == RegisteredPrefix.Length + RandomLength
