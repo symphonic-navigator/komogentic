@@ -8,7 +8,7 @@ using Komogentic.Server.OAuth;
 
 namespace Komogentic.Server.Tests.Komodo;
 
-/// <summary>Komogentic sends Komodo the twelve calls of the spec and nothing else (CLAUDE.md, "Security rules").</summary>
+/// <summary>Komogentic sends Komodo the thirteen calls of the spec and nothing else (CLAUDE.md, "Security rules").</summary>
 public sealed partial class ClosedListTests
 {
     private static readonly Dictionary<string, string> Expected = new()
@@ -23,6 +23,7 @@ public sealed partial class ClosedListTests
         ["SearchStackLog"] = "/read",
         ["ListUpdates"] = "/read",
         ["GetUpdate"] = "/read",
+        ["InspectImage"] = "/read",
         ["DeployStack"] = "/execute",
         ["RestartStack"] = "/execute",
     };

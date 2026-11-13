@@ -22,6 +22,7 @@ public sealed class KomodoCall
     public static readonly KomodoCall SearchStackLog = new("SearchStackLog", Read);
     public static readonly KomodoCall ListUpdates = new("ListUpdates", Read);
     public static readonly KomodoCall GetUpdate = new("GetUpdate", Read);
+    public static readonly KomodoCall InspectImage = new("InspectImage", Read);
     public static readonly KomodoCall DeployStack = new("DeployStack", Execute);
     public static readonly KomodoCall RestartStack = new("RestartStack", Execute);
 
@@ -46,7 +47,7 @@ public static class KomodoCalls
     [
         KomodoCall.LoginLocalUser, KomodoCall.CreateApiKey, KomodoCall.DeleteApiKey,
         KomodoCall.ListStacks, KomodoCall.GetStack, KomodoCall.ListStackServices, KomodoCall.GetStackLog,
-        KomodoCall.SearchStackLog, KomodoCall.ListUpdates, KomodoCall.GetUpdate,
+        KomodoCall.SearchStackLog, KomodoCall.ListUpdates, KomodoCall.GetUpdate, KomodoCall.InspectImage,
         KomodoCall.DeployStack, KomodoCall.RestartStack,
     ];
 

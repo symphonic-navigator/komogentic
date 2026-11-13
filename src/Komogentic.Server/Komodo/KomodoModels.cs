@@ -66,8 +66,9 @@ public sealed record StackService(
     string State);
 
 /// <summary><c>entities/docker/container.rs</c> <c>ContainerListItem</c>; <c>State</c> lowercase, health only inside <c>Status</c>
-/// ("Up 5 minutes (healthy)"), which Komodo leaves out when it has none.</summary>
-public sealed record ContainerListItem(string Name, string State, string? Status = null);
+/// ("Up 5 minutes (healthy)"), which Komodo leaves out when it has none, as it does an <c>ImageId</c> (<c>sha256:…</c>)
+/// Docker didn't give.</summary>
+public sealed record ContainerListItem(string Name, string State, string? Status = null, string? ImageId = null);
 
 /// <summary><c>entities/docker/service.rs</c> <c>SwarmServiceListItem</c>, whose fields are PascalCase.</summary>
 public sealed record SwarmServiceListItem(

@@ -13,5 +13,6 @@ The first version.
 - **Connections for apps with MCP OAuth** (Grok, claude.ai, ChatGPT web): one URL per connection, a consent page, tokens that refresh for as long as the connection lives (30, 90 or 365 days, or never).
 - **API keys for local agents** (Claude Code, Hermes, ChatGPT desktop), shown once.
 - **Each connection and API key owns one Komodo API key** of its user, named `komogentic/<name>`; revoking deletes it, and a key deleted in Komodo shows the connection as needing a reconnect.
+- **Which build runs behind `:latest`:** `get_stack_status` shows each service's image with its short id and its version (the image's `org.opencontainers.image.version` label), best effort: the version needs Read on the stack's server in Komodo. It also names the image the compose file names now, when that differs.
 - **An audit line per tool call** in the log: user, connection or key, app, tool, stack, outcome.
-- **Deployment:** one image, `ghcr.io/symphonic-navigator/komogentic`, signed with cosign; Compose with MongoDB, and optionally Traefik.
+- **Deployment:** one image, `ghcr.io/symphonic-navigator/komogentic`, signed with cosign, its version in the `org.opencontainers.image.version` label (`0.1.0-pre.N` for builds of `master`); Compose with MongoDB, and optionally Traefik.

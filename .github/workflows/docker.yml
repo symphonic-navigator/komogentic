@@ -80,6 +80,11 @@ jobs:
             type=semver,pattern={{major}}
             type=sha
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+          # The action's own version label is the branch name on a master push
+          # ("master"); Komogentic's get_stack_status shows this label, so it
+          # carries the computed version (0.1.0, or 0.1.0-pre.N) instead.
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
       - name: Build and push Docker image
         id: build-and-push

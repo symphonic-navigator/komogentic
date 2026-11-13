@@ -54,7 +54,9 @@ public sealed record FakeService(
     string ContainerState = "running",
     string? Status = "Up 5 minutes",
     bool UpdateAvailable = false,
-    string? LatestImage = null);
+    string? LatestImage = null,
+    /// <summary>The container's <c>image_id</c> (<c>sha256:…</c>), which Komodo leaves out when Docker gave none.</summary>
+    string? ImageId = null);
 
 public sealed record FakeLog(string Stage, string Stdout = "", string Stderr = "", bool Success = true, string Command = "");
 
@@ -118,7 +120,7 @@ public sealed class FakeStack(string id, string name, string serverName, string 
 
 /// <summary>
 /// Komodo Core 2.3.4 as far as Komogentic uses it, in process on a loopback port: users, JWTs, API keys, stacks,
-/// permissions, updates and the twelve calls of the closed list. Shapes follow Komodo's and the mogh crates' sources;
+/// permissions, images on servers, updates and the thirteen calls of the closed list. Shapes follow Komodo's and the mogh crates' sources;
 /// what could not be confirmed from them is marked <c>Unconfirmed:</c>.
 /// </summary>
 public sealed class FakeKomodo : IAsyncDisposable
@@ -130,6 +132,7 @@ public sealed class FakeKomodo : IAsyncDisposable
     private readonly Dictionary<string, FakeUser> _users = [];
     private readonly Dictionary<string, FakeStack> _stacks = [];
     private readonly Dictionary<string, FakeApiKey> _keys = [];
+    private readonly Dictionary<(string Server, string ImageId), Dictionary<string, string>?> _images = [];
     private readonly Dictionary<string, Queue<(int Status, string Body)>> _failNext = [];
     private readonly Dictionary<string, (int Status, string Body)> _failAlways = [];
     private readonly ConcurrentDictionary<string, TimeSpan> _delays = [];
@@ -225,9 +228,17 @@ public sealed class FakeKomodo : IAsyncDisposable
         lock (_gate) return Find(idOrName) ?? throw new KeyNotFoundException(idOrName);
     }
 
+    /// <summary>A permission on a stack, or on a server by its id (<see cref="FakeStack.ServerId"/>).</summary>
     public void Grant(string userId, string stackId, FakePermission permission)
     {
         lock (_gate) _users[userId].Permissions[stackId] = permission;
+    }
+
+    /// <summary>An image in the server's Docker, by its id; <paramref name="labels"/> null for an image without any
+    /// (Docker's <c>Config.Labels</c> is then null).</summary>
+    public void AddImage(string serverId, string imageId, Dictionary<string, string>? labels)
+    {
+        lock (_gate) _images[(serverId, imageId)] = labels;
     }
 
     public FakeUpdate AddUpdate(string stackId, string userId, string operation, bool success, long startTs, long? endTs, params FakeLog[] logs)
@@ -430,6 +441,7 @@ public sealed class FakeKomodo : IAsyncDisposable
                 "SearchStackLog" => WithStack(user!, parameters, FakePermission.Read | FakePermission.Logs, s => SearchStackLog(s, parameters)),
                 "ListUpdates" => ListUpdates(user!, parameters),
                 "GetUpdate" => GetUpdate(user!, parameters),
+                "InspectImage" => InspectImage(user!, parameters),
                 "DeployStack" => Execute(user!, parameters, "DeployStack", "DeployStackService"),
                 "RestartStack" => Execute(user!, parameters, "RestartStack", "RestartStackService"),
                 _ => throw new InvalidOperationException(type),
@@ -575,6 +587,28 @@ public sealed class FakeKomodo : IAsyncDisposable
         return (granted & needed) == needed;
     }
 
+    // komodo bin/core/src/api/read/docker.rs InspectImage: Read on the server (get_check_permissions::<Server>), then
+    // Periphery's docker inspect. Unconfirmed: Periphery's error text for an image the host doesn't have.
+    private Answer InspectImage(FakeUser user, JsonElement p)
+    {
+        var server = p.GetProperty("server").GetString()!;
+        var id = _stacks.Values.FirstOrDefault(s => s.SwarmId == "" && (s.ServerId == server || s.ServerName == server))?.ServerId;
+        if (id is null)
+            return Error(500, $"Did not find any Server matching {server}");
+        if (!user.Admin && (user.Permissions.GetValueOrDefault(id) & (FakePermission.Read | FakePermission.Execute)) == 0)
+            return Error(500, "User does not have required permissions on this Server. Must have at least Read permissions");
+        var image = p.GetProperty("image").GetString()!;
+        if (!_images.TryGetValue((id, image), out var labels))
+            return Error(500, $"Failed to inspect image | No such image: {image}");
+        // client/core/rs/src/entities/docker/image.rs Image and ImageConfig: Docker's PascalCase names.
+        return new Answer(200, new Dictionary<string, object?>
+        {
+            ["Id"] = image,
+            ["RepoTags"] = Array.Empty<string>(),
+            ["Config"] = new Dictionary<string, object?> { ["Labels"] = labels },
+        });
+    }
+
     private FakeStack? Find(string idOrName) =>
         _stacks.GetValueOrDefault(idOrName) ?? _stacks.Values.FirstOrDefault(s => s.Name == idOrName);
 
@@ -686,6 +720,7 @@ public sealed class FakeKomodo : IAsyncDisposable
     {
         var container = new Dictionary<string, object> { ["name"] = $"{s.Name}-{v.Service}-1", ["image"] = v.Image, ["state"] = v.ContainerState };
         if (v.Status is { } status) container["status"] = status;
+        if (v.ImageId is { } imageId) container["image_id"] = imageId;
         return container;
     }
 

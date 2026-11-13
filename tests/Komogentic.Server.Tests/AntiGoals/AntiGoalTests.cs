@@ -43,6 +43,7 @@ public sealed partial class AntiGoalTests(AppFactory app) : IDisposable
         ["SearchStackLog"] = "/read",
         ["ListUpdates"] = "/read",
         ["GetUpdate"] = "/read",
+        ["InspectImage"] = "/read",
         ["DeployStack"] = "/execute",
         ["RestartStack"] = "/execute",
     };
@@ -75,8 +76,9 @@ public sealed partial class AntiGoalTests(AppFactory app) : IDisposable
 
     private FakeStack AddStack(Owner owner, string name, FakePermission permission)
     {
+        // The backend's image id makes get_stack_status ask InspectImage for its version.
         var stack = app.Komodo.AddStack(NewId(), $"{name}-{Guid.NewGuid().ToString("N")[..8]}",
-            services: [new FakeService("web", "nginx:1", Status: "Up 5 minutes (healthy)"), new FakeService("backend", "app:latest")]);
+            services: [new FakeService("web", "nginx:1", Status: "Up 5 minutes (healthy)"), new FakeService("backend", "app:latest", ImageId: "sha256:" + new string('a', 64))]);
         app.Komodo.Grant(owner.UserId, stack.Id, permission);
         return stack;
     }

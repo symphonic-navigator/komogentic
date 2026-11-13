@@ -14,7 +14,7 @@ Licence: AGPL-3.0-or-later.
 | Tool | What it does | Changes something |
 |---|---|---|
 | `list_stacks` | Every stack you can see: name, server, state and a verdict, `green`, `yellow` or `red`. "Is everything green?" is this tool. | no |
-| `get_stack_status` | One stack: the verdict and why; per service the container state, health, image and whether an update is available. | no |
+| `get_stack_status` | One stack: the verdict and why; per service the container state, health, image (with its short id and, where Komodo can tell, its version) and whether an update is available. | no |
 | `get_stack_logs` | Recent log lines (`tail`, default 200, at most 5000; `timestamps`), of all services or chosen ones. With `search` terms (any or all of them, case-insensitive, taken literally), the matching lines of the last 5000 instead. | no |
 | `list_stack_updates` | The last operations on a stack (default 10): what, who, start, end, success. With `update_id`, that update's logs. | no |
 | `deploy_stack` | Deploys a stack or chosen services, waits for Komodo's update (default 50 s, `wait_seconds` up to 600), then reports success or failure with the relevant log and the new verdict. | yes |
@@ -45,6 +45,7 @@ A service whose container exited with code 0 (a one-off job such as a migration)
 - **Read** on a stack to see it, its services and its updates.
 - **Read with the Logs permission** on a stack to read its logs (Komodo asks for it on log calls); without it the log tools say so.
 - **Execute** on a stack to deploy and restart it.
+- **Read on the stack's server** to see image versions in `get_stack_status` (Komodo asks for it on `InspectImage`). Without it the version is left out and everything else works. The version is the image's `org.opencontainers.image.version` label, which most release workflows set; images without it show their short id only, and Swarm stacks show neither.
 - Komodo's own limits apply. Note especially its **sign-in rate limit**: Komodo counts failed authentications per IP address (by default 5 in 15 s), and it sees all of Komogentic's requests coming from one address. Komogentic therefore limits sign-ins itself (3 a minute per username; per address 4 in 15 s and 5 a minute, IPv6 per /48) and never retries a credential Komodo refused. That keeps one address from tripping Komodo's limit, but several addresses guessing together can still hold everyone's sign-in off for a while: **raise `KOMODO_AUTH_RATE_LIMIT_MAX_ATTEMPTS` in Komodo** when a Komogentic is shared. Agents are counted by Komodo's other limiter: if many `komogentic/` keys are deleted in Komodo at once, the stale agents' first calls can trip it for one window (15 s by default) for every agent. The flip side of Komogentic's own limit: anyone can use up a known username's three attempts a minute, which delays that person's sign-in by a minute; it never exposes anything.
 
 ## Installation
