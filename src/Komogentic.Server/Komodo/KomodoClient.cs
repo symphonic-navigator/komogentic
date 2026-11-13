@@ -158,14 +158,12 @@ public sealed partial class KomodoClient(HttpClient http)
         return Read<Update>(KomodoCall.GetUpdate.Name, answer);
     }
 
-    /// <summary>The OCI label every release workflow sets to the image's version.</summary>
-    public const string VersionLabel = "org.opencontainers.image.version";
-
     /// <summary>
-    /// The <see cref="VersionLabel"/> of an image on a server, null for an image without it. <c>image</c> takes an image
-    /// id too. Komodo asks for Read on the server (bin/core/src/api/read/docker.rs), not on a stack.
+    /// The labels of an image on a server, its own and those it inherited from its base image alike; empty for an image
+    /// without any. <c>image</c> takes an image id too. Komodo asks for Read on the server
+    /// (bin/core/src/api/read/docker.rs), not on a stack.
     /// </summary>
-    public async Task<string?> InspectImageVersionAsync(KomodoAuth auth, string server, string image, CancellationToken ct)
+    public async Task<IReadOnlyDictionary<string, string>> InspectImageLabelsAsync(KomodoAuth auth, string server, string image, CancellationToken ct)
     {
         var answer = await SendAsync(KomodoCall.InspectImage, auth, new { server, image }, ct);
         // entities/docker/image.rs Image.Config.Labels: Docker's PascalCase names, every level an Option.
@@ -173,9 +171,8 @@ public sealed partial class KomodoClient(HttpClient http)
             a.ValueKind == JsonValueKind.Object
             && a.TryGetProperty("Config", out var config) && config.ValueKind == JsonValueKind.Object
             && config.TryGetProperty("Labels", out var labels) && labels.ValueKind == JsonValueKind.Object
-            && labels.TryGetProperty(VersionLabel, out var version) && version.ValueKind == JsonValueKind.String
-                ? version.GetString()
-                : null);
+                ? labels.EnumerateObject().Where(l => l.Value.ValueKind == JsonValueKind.String).ToDictionary(l => l.Name, l => l.Value.GetString()!, StringComparer.Ordinal)
+                : new Dictionary<string, string>());
     }
 
     /// <summary>

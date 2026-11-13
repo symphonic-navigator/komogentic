@@ -104,7 +104,8 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 var status = service.Container?.Status is { Length: > 0 } s ? $" (\"{s}\")" : "";
                 var update = item.Info.Services.FirstOrDefault(u => u.Service == service.Service) is { } u
                     ? (u.UpdateAvailable ? ", update available" : "")
-                      + (u.LatestImage is { Length: > 0 } latest && latest != service.Image ? $", the compose file now names {latest}" : "")
+                      // Komodo's latest_image is the compose file's text: with a variable in it, not an image Komogentic could name.
+                      + (u.LatestImage is { Length: > 0 } latest && latest != service.Image && !latest.Contains('$') ? $", the compose file now names {latest}" : "")
                     : "";
                 var counted = Verdict.IsIgnored(service, found.IgnoreServices) ? "ignored (in the stack's ignore_services), not counted"
                     : Verdict.IsCompleted(service) ? "completed, not counted"
@@ -469,7 +470,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         {
             try
             {
-                if (Version(await komodo.InspectImageVersionAsync(caller.Komodo, stack.Info.ServerId, id, t)) is { } version) versions[id] = version;
+                if (Version(await komodo.InspectImageLabelsAsync(caller.Komodo, stack.Info.ServerId, id, t)) is { } version) versions[id] = version;
             }
             catch (KomodoException)
             {
@@ -492,8 +493,18 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
     private static string? ShortImageId(string? id) =>
         id is not null && ImageId().IsMatch(id) ? id["sha256:".Length..("sha256:".Length + 12)] : null;
 
-    /// <summary>A label is whatever the image's author wrote: only a short, version-like one reaches the agent.</summary>
-    private static string? Version(string? label) => label?.Trim() is { } v && VersionText().IsMatch(v) ? v : null;
+    /// <summary>
+    /// The image's own version, or null. Docker can't tell an image's labels from those of its base image: mongo:8
+    /// sets none and carries ubuntu:24.04's version, 24.04. A build pipeline that sets the version (docker/metadata-action,
+    /// for one) sets the image's source or revision too, which an operating system's base image doesn't; without
+    /// either, the version is taken for inherited. A label is whatever the image's author wrote, so only a short,
+    /// version-like one reaches the agent.
+    /// </summary>
+    private static string? Version(IReadOnlyDictionary<string, string> labels) =>
+        (labels.ContainsKey("org.opencontainers.image.source") || labels.ContainsKey("org.opencontainers.image.revision"))
+        && labels.GetValueOrDefault("org.opencontainers.image.version")?.Trim() is { } v && VersionText().IsMatch(v)
+            ? v
+            : null;
 
     private static string Outcome(string status, bool success) => status != "Complete" ? "in progress" : success ? "succeeded" : "failed";
 

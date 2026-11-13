@@ -212,7 +212,12 @@ public sealed class StackToolsTests : IAsyncLifetime
     private List<FakeRequest> Inspected(params string[] ids) =>
         Requests("InspectImage").Where(r => ids.Contains(r.Params.GetProperty("image").GetString())).ToList();
 
-    private static Dictionary<string, string> VersionLabel(string version) => new() { ["org.opencontainers.image.version"] = version };
+    /// <summary>The labels a build pipeline sets (docker/metadata-action, for one): the version and its source.</summary>
+    private static Dictionary<string, string> VersionLabel(string version) => new()
+    {
+        ["org.opencontainers.image.version"] = version,
+        ["org.opencontainers.image.source"] = "https://github.com/example/app",
+    };
 
     [Fact]
     public async Task Status_shows_each_image_id_and_version()
@@ -268,6 +273,23 @@ public sealed class StackToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Status_leaves_out_a_version_inherited_from_the_base_image()
+    {
+        var (mongo, app) = (NewImageId(), NewImageId());
+        var stack = AddApp(services: [new FakeService("mongo", "mongo:8", ImageId: mongo), new FakeService("app", "app:latest", ImageId: app)]);
+        _app.Komodo.Grant(_userId, stack.ServerId, FakePermission.Read);
+        // mongo:8 sets no labels of its own and inherits ubuntu:24.04's.
+        _app.Komodo.AddImage(stack.ServerId, mongo, new() { ["org.opencontainers.image.ref.name"] = "ubuntu", ["org.opencontainers.image.version"] = "24.04" });
+        // A revision vouches for the version as much as a source does.
+        _app.Komodo.AddImage(stack.ServerId, app, new() { ["org.opencontainers.image.version"] = "2.0.1", ["org.opencontainers.image.revision"] = "0a1b2c3" });
+
+        var text = await OkAsync("get_stack_status", new { stack = App });
+
+        Assert.Contains($"image mongo:8 (id {mongo[7..19]}) — ", text, StringComparison.Ordinal);
+        Assert.Contains($"image app:latest (version 2.0.1, id {app[7..19]}) — ", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Status_survives_a_failing_inspect()
     {
         var id = NewImageId();
@@ -300,6 +322,18 @@ public sealed class StackToolsTests : IAsyncLifetime
         var text = await OkAsync("get_stack_status", new { stack = App });
 
         Assert.Contains("image nginx:1, update available, the compose file now names nginx:2 — ", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Status_leaves_out_a_compose_image_with_variables()
+    {
+        // Komodo's latest_image is the compose file's text, variables unresolved: never the image that would run.
+        AddApp(services: [new FakeService("web", "nginx:1", LatestImage: "${WEB_IMAGE:-nginx:1}")]);
+
+        var text = await OkAsync("get_stack_status", new { stack = App });
+
+        Assert.Contains("image nginx:1 — ", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("compose file", text, StringComparison.Ordinal);
     }
 
     [Fact]
