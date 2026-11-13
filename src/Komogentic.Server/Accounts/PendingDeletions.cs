@@ -30,6 +30,22 @@ public sealed class PendingDeletions(IMongoDatabase db, KomodoClient komodo, Tim
     /// </summary>
     public async Task AddAsync(IClientSessionHandle? s, string userId, string komodoKey, string reason, CancellationToken ct, DateTime? notBefore = null)
     {
+        try
+        {
+            await AddOrThrowAsync(s, userId, komodoKey, reason, notBefore, ct);
+        }
+        catch (Exception e) when (s is null)
+        {
+            // Then nothing remembers the key. Its id is no secret, and nobody holds its secret: named here, it can be
+            // deleted in Komodo by hand. (In a transaction, the caller cleans up if the transaction fails.)
+            log.LogWarning("The Komodo key {KomodoKey} of user {UserId} could not be queued for deletion ({Reason}, {Error}); delete it in Komodo by hand",
+                komodoKey, userId, reason, e.GetType().Name);
+            throw;
+        }
+    }
+
+    private async Task AddOrThrowAsync(IClientSessionHandle? s, string userId, string komodoKey, string reason, DateTime? notBefore, CancellationToken ct)
+    {
         // Outside the transaction: indexes can't be created inside one.
         await EnsureReadyAsync(ct);
         var filter = Builders<PendingDeletionDocument>.Filter.Where(d => d.User == userId && d.KomodoKey == komodoKey);

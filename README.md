@@ -45,7 +45,7 @@ A service whose container exited with code 0 (a one-off job such as a migration)
 - **Read** on a stack to see it, its services and its updates.
 - **Read with the Logs permission** on a stack to read its logs (Komodo asks for it on log calls); without it the log tools say so.
 - **Execute** on a stack to deploy and restart it.
-- Komodo's own limits apply. Note especially its **sign-in rate limit**: Komodo counts failed authentications per IP address (by default 5 in 15 s), and it sees all of Komogentic's requests coming from one address. Komogentic therefore limits sign-ins itself (3 a minute per username, 5 per address) and never retries a credential Komodo refused. If several people share a Komogentic, consider raising `KOMODO_AUTH_RATE_LIMIT_MAX_ATTEMPTS` in Komodo.
+- Komodo's own limits apply. Note especially its **sign-in rate limit**: Komodo counts failed authentications per IP address (by default 5 in 15 s), and it sees all of Komogentic's requests coming from one address. Komogentic therefore limits sign-ins itself (3 a minute per username, 5 per address) and never retries a credential Komodo refused. If several people share a Komogentic, consider raising `KOMODO_AUTH_RATE_LIMIT_MAX_ATTEMPTS` in Komodo. The flip side of Komogentic's own limit: anyone can use up a known username's three attempts a minute, which delays that person's sign-in by a minute; it never exposes anything.
 
 ## Installation
 
@@ -122,6 +122,7 @@ An app that asks only for the scope `komodo:read` gets the four reading tools on
 - **Each Komodo API secret** is sealed with AES-256-GCM under a key derived from each token that may use it: the connection's access and refresh tokens, or the API key. Tokens and keys are stored only as HKDF lookups. A database dump alone opens nothing.
 - The session cookie is `HttpOnly`, `Secure`, `SameSite=Strict` and sent only to `/api`; every state-changing `/api` request must come from Komogentic's own pages (an `Origin` check).
 - Komodo keys of revoked or dead credentials are deleted with the JWT of your next sign-in or consent; until then nobody holds their secret, and their `komogentic/` name prefix makes them easy to spot in Komodo.
+- **Known limits, by design (as in Kumbu²):** an authorisation code that is presented again within 10 minutes of its expiry revokes the connection's tokens; later than that it is just refused. A refresh token of an older set, presented beside a newer one, also revokes the connection's tokens, so whoever holds a stale refresh token can force a reconnect, though never get in. If MongoDB fails at the very moment a Komodo key is being created and cleaned up again, the log names the key's id (never its secret) so it can be deleted by hand.
 - Komodo records you as the operator of every deploy and restart. Komogentic's log adds, for every tool call, the user, the connection or key, the app, the tool, the stack and the outcome, without secrets.
 
 ## Development
