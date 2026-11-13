@@ -69,7 +69,38 @@ Already running a Traefik? Copy the `komogentic` service's labels and networks f
 
 **Deployed by Komodo itself:** add the two Compose files as a stack in Komodo, following `:latest`, with the `.env` values as the stack's environment.
 
-**Reaching Komodo:** prefer an internal Docker network between Komogentic and Komodo Core (put both on one network in a `compose.override.yaml` and use Komodo Core's container name in `KOMOGENTIC_KOMODO_URL`). Each request carries a Komodo API secret in its headers: plain `http` only on such an internal network.
+**Reaching Komodo:** each request carries a Komodo API secret in its headers, so prefer an internal Docker network between Komogentic and Komodo Core; plain `http` only on such a network. Keep Komogentic and Komodo two Compose projects (Komodo deploys Komogentic as a stack; in Komodo's own project, a `deploy_stack` would restart Komodo), and give them a small network of their own with only the two servers on it:
+
+```sh
+docker network create komodo-bridge
+```
+
+In Komogentic's `compose.override.yaml`:
+
+```yaml
+services:
+  komogentic:
+    networks: [default, komodo-bridge]
+networks:
+  komodo-bridge:
+    external: true
+```
+
+In Komodo's Compose file, for Komodo Core's service (`core` in Komodo's own examples), with a name of its own on that network:
+
+```yaml
+services:
+  core:
+    networks:
+      default:
+      komodo-bridge:
+        aliases: [komodo-core]
+networks:
+  komodo-bridge:
+    external: true
+```
+
+Then `KOMOGENTIC_KOMODO_URL=http://komodo-core:9120`. **Don't put Komogentic on Komodo's default network instead:** both projects have a service named `mongo`, Docker's DNS then knows two, and Komogentic may reach Komodo's database instead of its own. On `komodo-bridge`, Komodo Core can reach Komogentic directly; with `KOMOGENTIC_TRUSTED_PROXY=true` it could set the address Komogentic's rate limits count, which matters only if you don't trust what runs in Komodo Core (Actions, for one).
 
 **MongoDB** runs as a single-node replica set (`rs0`): Komogentic's token rotation and consent write several documents in one transaction. `compose.yaml` initiates it on the first start.
 
@@ -87,7 +118,7 @@ cosign verify ghcr.io/symphonic-navigator/komogentic:latest \
 
 | Variable | What it does | Format | Example |
 |---|---|---|---|
-| `KOMOGENTIC_KOMODO_URL` | Required. Where Komogentic reaches Komodo Core, from inside its container. | Absolute `http(s)` URL, no path | `http://komodo-core:9120` |
+| `KOMOGENTIC_KOMODO_URL` | Required. Where Komogentic reaches Komodo Core, from inside its container (Komodo Core's name on a shared Docker network, see "Reaching Komodo"; never the same Compose project). | Absolute `http(s)` URL, no path | `http://komodo-core:9120` |
 | `KOMOGENTIC_PUBLIC_URL` | Where people and apps reach Komogentic. Connection URLs, OAuth metadata and the dashboard's Origin check are built from it. Not used with `compose.traefik.yaml`. | Scheme, host and port, no path | `https://komogentic.example.org` |
 | `KOMOGENTIC_KOMODO_TIMEOUT_SECONDS` | How long one Komodo request may take (default 30). | Seconds, 1–600 | `30` |
 | `KOMOGENTIC_OAUTH_ACCESS_TOKEN_MINUTES` | Lifetime of an app connection's access token (default 60). Shorter means more refreshes. | Minutes, 5–1440 | `60` |
