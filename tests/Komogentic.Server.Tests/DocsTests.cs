@@ -33,7 +33,7 @@ public sealed partial class DocsTests
         var project = File.ReadAllText(Path.Combine(Root, "src/Komogentic.Server/Komogentic.Server.csproj"));
         using var web = JsonDocument.Parse(File.ReadAllText(Path.Combine(Root, "web/package.json")));
 
-        Assert.Equal("0.1.0", version);
+        Assert.Matches(@"^[0-9]+\.[0-9]+\.[0-9]+$", version);
         Assert.Contains($"<Version>{version}</Version>", project, StringComparison.Ordinal);
         Assert.Equal(version, web.RootElement.GetProperty("version").GetString());
     }

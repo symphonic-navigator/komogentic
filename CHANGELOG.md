@@ -2,7 +2,7 @@
 
 What changed for the people who use and run Komogentic, per release.
 
-## 0.1.1 (unreleased)
+## 0.1.1 (2026-11-13)
 
 ### Fixed
 
