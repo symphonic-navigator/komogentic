@@ -6,7 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
-    <PackageReference Include="MongoDB.Driver" Version="3.13.0" />
+    <PackageReference Include="MongoDB.Driver" Version="3.14.0" />
   </ItemGroup>
 
   <ItemGroup>
