@@ -28,7 +28,7 @@ Licence: AGPL-3.0-or-later.
 - **yellow**: the stack is deploying, or a service is being created or its health check is still starting;
 - **red**: anything else: down, stopped, paused, exited with an error, dead, unhealthy, restarting in a loop, unknown.
 
-A service whose container exited with code 0 (a one-off job such as a migration) counts as completed, not red. "Update available" is shown but doesn't change the colour.
+A service whose container exited with code 0 (a one-off job such as a migration) counts as completed, not red, and the services in the stack's `ignore_services` (Komodo's setting for init containers and the like) don't count at all. Compose files missing from the repository, or a compose project missing on the host while the stack should be up, make it red. "Update available" is shown but doesn't change the colour.
 
 **Why the default wait is 50 s:** many MCP clients cut off a tool call after 60 s. When the wait ends first, the tool says the operation is still running and gives the update id, which `list_stack_updates` follows. Clients with longer limits (Claude Code) can pass a larger `wait_seconds`.
 
@@ -37,7 +37,7 @@ A service whose container exited with code 0 (a one-off job such as a migration)
 - move a stack that pins a version in Komodo's own configuration to another version (it can still redeploy and restart it);
 - deploy a pre-release (`-pre.N`), which never reaches `:latest`, unless the stack follows such a tag.
 
-**Swarm-mode stacks** use the same calls. Their verdict comes from Komodo's swarm state per service (`Healthy`, `Unhealthy`, `Down`) and **is untested** against a live swarm. Their logs can be read one service at a time only (Komodo's limit): pass exactly one service.
+**Swarm-mode stacks** use the same calls. Their verdict comes from Komodo's swarm state per service (`Healthy`, `Unhealthy`, `Down`) and **is untested** against a live swarm. Their logs can be read one service at a time only (Komodo's limit): pass exactly one service. They can't be searched: Komodo 2.3.4's `SearchStackLog` asks the swarm for the bare service name, which it doesn't know, so `get_stack_logs` refuses a search there and points to the tail.
 
 ## What a Komodo user needs
 

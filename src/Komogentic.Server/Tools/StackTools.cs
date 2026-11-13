@@ -32,14 +32,23 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         "deploy_stack and restart_stack change running software, so confirm with the user first; they wait for Komodo's " +
         "update and report its outcome, or give an update id to follow with list_stack_updates.";
 
-    internal static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(2);
+    /// <summary>How long to wait before the next <c>GetUpdate</c>: every 2 s for the first 30 s of the call, as most
+    /// deploys end by then, then every 5 s.</summary>
+    internal static TimeSpan PollDelay(TimeSpan elapsed) => elapsed < TimeSpan.FromSeconds(30) ? TimeSpan.FromSeconds(2) : TimeSpan.FromSeconds(5);
 
     private const int MaxLogLines = 5000;
     private const int MaxLogChars = 200_000;
+    // docker compose's own complaints, not the services' logs: a share of their own, so that they can't push stdout out.
+    private const int MaxStderrLines = 500;
+    private const int MaxStderrChars = 20_000;
     private const int MaxUpdateLogChars = 20_000;
     private const int MaxParallel = 4;
 
     private ILogger AuditLog => logs.CreateLogger(Audit.Category);
+
+    /// <summary>The stack's canonical name once <see cref="StackAsync"/> has found it, for the audit line. The SDK makes
+    /// an instance per tool call.</summary>
+    private string? _auditStack;
 
     [McpServerTool(Name = "list_stacks", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Every Komodo stack your user can see, one line each: name — server — state — verdict (green, yellow or red), " +
@@ -48,19 +57,20 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         RunAsync("list_stacks", null, async () =>
         {
             var stacks = (await komodo.ListStacksAsync(caller.Komodo, ct)).OrderBy(s => s.Name, StringComparer.Ordinal).ToList();
-            // Decision 8: "green" includes health, which only the services tell.
+            // Decision 8: "green" includes health, which only the services tell; which of them count, only GetStack.
             var services = new IReadOnlyList<StackService>?[stacks.Count];
+            var ignored = new IReadOnlyList<string>?[stacks.Count];
             await Parallel.ForEachAsync(
                 Enumerable.Range(0, stacks.Count).Where(i => stacks[i].Info.State is "running" or "unhealthy"),
                 new ParallelOptions { MaxDegreeOfParallelism = MaxParallel, CancellationToken = ct },
-                async (i, t) => services[i] = await ServicesOrNullAsync(stacks[i].Name, t));
+                async (i, t) => (services[i], ignored[i]) = await HealthOrNullAsync(stacks[i], t));
 
             var text = new StringBuilder();
             if (stacks.Count == 0) text.AppendLine("Your Komodo user sees no stacks.");
             var counts = new int[3];
             for (var i = 0; i < stacks.Count; i++)
             {
-                var (colour, _) = Verdict.OfStack(stacks[i], services[i]);
+                var (colour, _) = Verdict.OfStack(stacks[i], services[i], ignored[i]);
                 counts[(int)colour]++;
                 text.AppendLine($"{stacks[i].Name} — {Server(stacks[i])} — {stacks[i].Info.State} — {Verdict.Word(colour)}{UpdateNote(stacks[i])}");
             }
@@ -81,7 +91,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
             var item = await komodo.FindStackAsync(caller.Komodo, found.Name, ct)
                 ?? throw new ToolFailure(ToolErrors.NoSuchStack(ToolErrors.Shown(stack)), "no such stack");
             var services = await komodo.ListStackServicesAsync(caller.Komodo, found.Name, ct);
-            var (colour, why) = Verdict.OfStack(item, services);
+            var (colour, why) = Verdict.OfStack(item, services, found.IgnoreServices);
 
             var text = new StringBuilder($"{item.Name} — {Server(item)} — {item.Info.State} — {Verdict.Word(colour)}: {why}{UpdateNote(item)}");
             if (services.Count == 0) text.Append("\nKomodo lists no services for it.");
@@ -90,7 +100,9 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 var (serviceColour, serviceWhy) = Verdict.OfService(service);
                 var status = service.Container?.Status is { Length: > 0 } s ? $" (\"{s}\")" : "";
                 var update = item.Info.Services.Any(u => u.Service == service.Service && u.UpdateAvailable) ? ", update available" : "";
-                var counted = Verdict.IsCompleted(service) ? "completed, not counted" : $"{Verdict.Word(serviceColour)}: {serviceWhy}";
+                var counted = Verdict.IsIgnored(service, found.IgnoreServices) ? "ignored (in the stack's ignore_services), not counted"
+                    : Verdict.IsCompleted(service) ? "completed, not counted"
+                    : $"{Verdict.Word(serviceColour)}: {serviceWhy}";
                 text.Append($"\n- {service.Service}: {service.State}{status}, health: {Health(service)}, image {service.Image}{update} — {counted}");
             }
 
@@ -100,8 +112,9 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
     [McpServerTool(Name = "get_stack_logs", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Recent log lines of a stack, of all services or the ones named. With search, only the lines (of the last 5000) " +
                  "that contain any of the terms, or all of them with match_all; terms match literally and case-insensitively. " +
-                 "A Swarm stack's logs come one service at a time. Long output is cut to its last 5000 lines and 200 000 " +
-                 "characters, with a note. Needs the Logs permission on the stack in Komodo.")]
+                 "A Swarm stack's logs come one service at a time, and Komodo 2.3.4 can't search a Swarm stack's logs: read " +
+                 "its tail without search there. Long output is cut to its last 5000 lines and 200 000 characters, with a " +
+                 "note. Needs the Logs permission on the stack in Komodo.")]
     public Task<CallToolResult> GetStackLogs(
         [Description("The stack's Komodo name (or id)")] string stack,
         [Description("Only these services (names as get_stack_status shows them); leave out for all")] string[]? services = null,
@@ -119,6 +132,12 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 throw Invalid("each search term has 1 to 200 characters, without control characters");
 
             var found = await StackAsync(stack, ct);
+            // komodo bin/core/src/api/read/stack.rs SearchStackLog passes the bare service name to the Swarm, which knows
+            // the service as <stack>_<service> only (GetStackLog prefixes it): every Swarm search fails.
+            if (found.SwarmId.Length > 0 && terms.Length > 0)
+                throw new ToolFailure(
+                    $"Komodo 2.3.4 can't search the logs of a Swarm service (stack {found.Name} runs in Swarm mode): call get_stack_logs without search, with one service and a tail, and look through those lines",
+                    "swarm search unsupported");
             var chosen = await ServicesAsync(found, services, ct);
             // komodo bin/core/src/api/read/stack.rs: "Must pass single service for Swarm mode Stack logs".
             if (found.SwarmId.Length > 0 && chosen.Count != 1)
@@ -142,10 +161,11 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 throw new ToolFailure(ToolErrors.NoLogs(found.Name), "no logs permission");
             }
 
-            var output = log.Stderr.Length > 0 ? $"{log.Stdout.TrimEnd('\n')}\n--- stderr ---\n{log.Stderr}" : log.Stdout;
-            var (text, trimmed) = ToolText.Tail(output.TrimEnd('\n'), MaxLogLines, MaxLogChars);
-            if (text.Length == 0) text = terms.Length > 0 ? "(no line matches)" : "(no log lines)";
-            if (trimmed) text = $"[trimmed to the last {text.Count(c => c == '\n') + 1} lines, at most 5000 lines and 200 000 characters]\n{text}";
+            // grep exits 1 when no line matches, so Komodo's log of a search without a match fails, with nothing in it
+            // (bin/periphery/src/api/compose.rs GetComposeLogSearch, lib/command/src/lib.rs output_into_log).
+            if (terms.Length > 0 && !log.Success && string.IsNullOrWhiteSpace(log.Stdout) && string.IsNullOrWhiteSpace(log.Stderr))
+                return Ok("(no line matches)");
+            var text = LogOutput(log, terms.Length > 0);
             return log.Success ? Ok(text) : new ToolAnswer($"Komodo's log command failed on the server:\n{text}", true, "log command failed");
         });
 
@@ -168,6 +188,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
             if (items.Count == 0) return Ok($"stack {found.Name} has no updates yet");
             // amendment R8: the list items carry no end time.
             var ends = new long?[items.Count];
+            var unread = new bool[items.Count];
             await Parallel.ForEachAsync(
                 Enumerable.Range(0, items.Count),
                 new ParallelOptions { MaxDegreeOfParallelism = MaxParallel, CancellationToken = ct },
@@ -177,8 +198,10 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                     {
                         ends[i] = (await komodo.GetUpdateAsync(caller.Komodo, items[i].Id, t)).EndTs;
                     }
-                    catch (KomodoException e) when (e.Kind == KomodoErrorKind.NotFoundOrForbidden)
+                    catch (KomodoException e) when (e.Kind != KomodoErrorKind.Unauthorized)
                     {
+                        // One update that can't be read costs its end time, not the list.
+                        unread[i] = true;
                     }
                 });
 
@@ -186,7 +209,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
             for (var i = 0; i < items.Count; i++)
             {
                 var u = items[i];
-                var end = ends[i] is { } e ? $"ended {ToolText.Time(e)}" : u.Status == "Complete" ? "end unknown" : "not ended";
+                var end = ends[i] is { } e ? $"ended {ToolText.Time(e)}" : unread[i] || u.Status == "Complete" ? "end unknown" : "not ended";
                 text.Append($"\n{u.Id} — {u.Operation} — {u.Username} — started {ToolText.Time(u.StartTs)} — {end} — {Outcome(u.Status, u.Success)}");
             }
 
@@ -218,7 +241,9 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
     /// <summary>
     /// Deploy or restart, then wait for the update (amendment R9): one deadline, <paramref name="waitSeconds"/> from the
     /// start of the call, cancels every Komodo request in it, and the answer is then "still running" with the update id,
-    /// or that Komodo did not answer in time if there is none yet.
+    /// or that Komodo did not answer in time if there is none yet. Once the update id is known, a failing poll never
+    /// loses it: the next poll may answer, and if none does, the answer is still the id, not an error that invites a
+    /// second deploy.
     /// </summary>
     private async Task<ToolAnswer> ExecuteAsync(string verb, string stack, string[]? services, int waitSeconds, CancellationToken ct)
     {
@@ -228,19 +253,43 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, deadline.Token);
         var token = linked.Token;
         string? updateId = null;
+        var lastPollFailed = false;
         try
         {
             // GetStack first: Komodo accepts the execution of a stack the user may not even read, and fails it only later.
             var found = await StackAsync(stack, token);
             var chosen = await ServicesAsync(found, services, token);
-            var update = verb == "deploy"
-                ? await komodo.DeployStackAsync(caller.Komodo, found.Name, chosen, token)
-                : await komodo.RestartStackAsync(caller.Komodo, found.Name, chosen, token);
+            Update update;
+            try
+            {
+                update = verb == "deploy"
+                    ? await komodo.DeployStackAsync(caller.Komodo, found.Name, chosen, token)
+                    : await komodo.RestartStackAsync(caller.Komodo, found.Name, chosen, token);
+            }
+            catch (KomodoException e) when (e.Kind == KomodoErrorKind.NotFoundOrForbidden)
+            {
+                // GetStack (Read) answered, so this is the Execute permission the execution needs on top.
+                throw new ToolFailure(ToolErrors.NoExecute(found.Name), "no execute permission");
+            }
+
             updateId = update.Id;
             while (update.Status != "Complete")
             {
-                await Task.Delay(PollInterval, time, token);
-                update = await komodo.GetUpdateAsync(caller.Komodo, update.Id, token);
+                await Task.Delay(PollDelay(time.GetElapsedTime(started)), time, token);
+                try
+                {
+                    update = await komodo.GetUpdateAsync(caller.Komodo, updateId, token);
+                    lastPollFailed = false;
+                }
+                catch (KomodoException e) when (e.Kind == KomodoErrorKind.Unauthorized)
+                {
+                    var rejected = await KomodoFailureAsync(e, stack);
+                    return rejected with { Text = $"{rejected.Text} The {verb} was started as update {updateId}; follow it in Komodo." };
+                }
+                catch (KomodoException)
+                {
+                    lastPollFailed = true;
+                }
             }
 
             var seconds = update.EndTs is { } end ? (end - update.StartTs) / 1000.0 : time.GetElapsedTime(started).TotalSeconds;
@@ -266,7 +315,9 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
                 ? new ToolAnswer(
                     $"Komodo did not answer within {waitSeconds} s; the {verb} may or may not have started: check with list_stack_updates", true,
                     "komodo did not answer in time")
-                : new ToolAnswer($"still running after {waitSeconds} s; update id {updateId} — follow it with list_stack_updates", false, "still running");
+                : new ToolAnswer(
+                    $"still running{(lastPollFailed ? " (or unknown)" : "")} after {waitSeconds} s; update id {updateId} — follow it with list_stack_updates", false,
+                    lastPollFailed ? "still running or unknown" : "still running");
         }
     }
 
@@ -277,7 +328,7 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         {
             if (await komodo.FindStackAsync(caller.Komodo, stack.Name, token) is not { } item) return $"{stack.Name}'s state could not be read";
             var services = item.Info.State is "running" or "unhealthy" ? await komodo.ListStackServicesAsync(caller.Komodo, stack.Name, token) : null;
-            var (colour, why) = Verdict.OfStack(item, services);
+            var (colour, why) = Verdict.OfStack(item, services, stack.IgnoreServices);
             return colour == Colour.Green ? $"{stack.Name} is green" : $"{stack.Name} is {Verdict.Word(colour)} ({why})";
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -296,7 +347,9 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         if (string.IsNullOrWhiteSpace(stack)) throw Invalid("stack is required: a Komodo stack's name or id");
         try
         {
-            return await komodo.GetStackAsync(caller.Komodo, stack, ct);
+            var found = await komodo.GetStackAsync(caller.Komodo, stack, ct);
+            _auditStack = Audit.Text(found.Name);
+            return found;
         }
         catch (KomodoException e) when (e.Kind == KomodoErrorKind.NotFoundOrForbidden)
         {
@@ -320,15 +373,17 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
         return [.. services.Distinct(StringComparer.Ordinal)];
     }
 
-    private async Task<IReadOnlyList<StackService>?> ServicesOrNullAsync(string stack, CancellationToken ct)
+    /// <summary>A listed stack's services and the ones it ignores (GetStack by id), or nulls if Komodo won't say.</summary>
+    private async Task<(IReadOnlyList<StackService>? Services, IReadOnlyList<string>? Ignored)> HealthOrNullAsync(StackListItem stack, CancellationToken ct)
     {
         try
         {
-            return await komodo.ListStackServicesAsync(caller.Komodo, stack, ct);
+            var found = await komodo.GetStackAsync(caller.Komodo, stack.Id, ct);
+            return (await komodo.ListStackServicesAsync(caller.Komodo, stack.Name, ct), found.IgnoreServices);
         }
         catch (KomodoException e) when (e.Kind == KomodoErrorKind.NotFoundOrForbidden)
         {
-            return null;
+            return (null, null);
         }
     }
 
@@ -353,6 +408,26 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
     {
         var end = u.EndTs is { } e ? $"ended {ToolText.Time(e)}" : "not ended";
         return $"update {u.Id} of stack {stack.Name}: {u.Operation}, started {ToolText.Time(u.StartTs)}, {end}, {Outcome(u.Status, u.Success)}\n\n{LogsText(u.Logs)}";
+    }
+
+    /// <summary>A log tool's answer: stdout cut to its last 5000 lines and 200 000 characters, then stderr cut on its
+    /// own to its last 500 lines and 20 000, each with a note when cut.</summary>
+    private static string LogOutput(KomodoLog log, bool search)
+    {
+        var (stdout, stdoutTrimmed) = ToolText.Tail(log.Stdout.TrimEnd('\n'), MaxLogLines, MaxLogChars);
+        var (stderr, stderrTrimmed) = ToolText.Tail(log.Stderr.TrimEnd('\n'), MaxStderrLines, MaxStderrChars);
+        if (stdout.Length == 0 && stderr.Length == 0) return search ? "(no line matches)" : "(no log lines)";
+
+        var text = new StringBuilder();
+        if (stdoutTrimmed) text.Append($"[trimmed to the last {Lines(stdout)} lines, at most 5000 lines and 200 000 characters]\n");
+        text.Append(stdout);
+        if (stderr.Length == 0) return text.ToString();
+        if (text.Length > 0) text.Append('\n');
+        text.Append("--- stderr ---\n");
+        if (stderrTrimmed) text.Append($"[stderr trimmed to its last {Lines(stderr)} lines, at most 500 lines and 20 000 characters]\n");
+        return text.Append(stderr).ToString();
+
+        static int Lines(string s) => s.Count(c => c == '\n') + 1;
     }
 
     /// <summary>Each log's stage, command, stdout and stderr, each log cut to its last 20 000 characters.</summary>
@@ -394,25 +469,39 @@ public sealed partial class StackTools(RequestCaller caller, KomodoClient komodo
 
     private static ToolAnswer Ok(string text) => new(text, false, "ok");
 
-    /// <summary>Runs a tool body: its refusals and Komodo's failures become error results, and the call is audited.</summary>
+    /// <summary>Runs a tool body: its refusals and Komodo's failures become error results, and the call leaves exactly
+    /// one audit line however it ends: cancelled by the agent, or with an exception nobody expected.</summary>
     private async Task<CallToolResult> RunAsync(string tool, string? stack, Func<Task<ToolAnswer>> body)
     {
-        ToolAnswer answer;
+        var outcome = "error";
         try
         {
-            answer = await body();
-        }
-        catch (ToolFailure f)
-        {
-            answer = new ToolAnswer(f.Message, true, f.Outcome);
-        }
-        catch (KomodoException e)
-        {
-            answer = await KomodoFailureAsync(e, stack);
-        }
+            ToolAnswer answer;
+            try
+            {
+                answer = await body();
+            }
+            catch (ToolFailure f)
+            {
+                answer = new ToolAnswer(f.Message, true, f.Outcome);
+            }
+            catch (KomodoException e)
+            {
+                answer = await KomodoFailureAsync(e, stack);
+            }
 
-        Audit.Log(AuditLog, caller, tool, stack is null ? null : ToolErrors.Shown(stack), answer.Outcome);
-        return new CallToolResult { IsError = answer.IsError, Content = [new TextContentBlock { Text = answer.Text }] };
+            outcome = answer.Outcome;
+            return new CallToolResult { IsError = answer.IsError, Content = [new TextContentBlock { Text = answer.Text }] };
+        }
+        catch (OperationCanceledException)
+        {
+            outcome = "cancelled";
+            throw;
+        }
+        finally
+        {
+            Audit.Log(AuditLog, caller, tool, _auditStack ?? (stack is null ? null : Audit.Text(stack)), outcome);
+        }
     }
 
     private async Task<ToolAnswer> KomodoFailureAsync(KomodoException e, string? stack)

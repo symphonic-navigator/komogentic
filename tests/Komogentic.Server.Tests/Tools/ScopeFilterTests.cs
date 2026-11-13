@@ -34,4 +34,16 @@ public sealed class ScopeFilterTests
 
         Assert.Null(ScopeFilter.Refusal("list_stacks", readOnly: true));
     }
+
+    [Fact]
+    public void Refusal_reads_the_requested_name_too()
+    {
+        // Fails closed: without a matched tool, or with one that disagrees with the request, the request's name counts.
+        Assert.True(ScopeFilter.Refused(null, "deploy_stack", readOnly: true));
+        Assert.True(ScopeFilter.Refused("list_stacks", "restart_stack", readOnly: true));
+        Assert.True(ScopeFilter.Refused("deploy_stack", null, readOnly: true));
+        Assert.False(ScopeFilter.Refused(null, "deploy_stack", readOnly: false));
+        Assert.False(ScopeFilter.Refused("list_stacks", "list_stacks", readOnly: true));
+        Assert.False(ScopeFilter.Refused(null, null, readOnly: true));
+    }
 }

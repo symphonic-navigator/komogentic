@@ -104,6 +104,14 @@ public sealed class FakeStack(string id, string name, string serverName, string 
     public List<FakeService> Services { get; } = [];
     /// <summary>What <c>GetStackLog</c> and <c>SearchStackLog</c> read, one line per log line.</summary>
     public string LogText { get; set; } = "";
+    /// <summary>What <c>GetStackLog</c> answers as its stderr (<c>docker compose</c>'s own complaints).</summary>
+    public string LogStderr { get; set; } = "";
+    /// <summary><c>config.ignore_services</c>: services Komodo leaves out of the stack's state.</summary>
+    public List<string> IgnoreServices { get; } = [];
+    /// <summary><c>info.project_missing</c> of <c>ListStacks</c>.</summary>
+    public bool ProjectMissing { get; set; }
+    /// <summary><c>info.missing_files</c> of <c>ListStacks</c> and <c>GetStack</c>.</summary>
+    public List<string> MissingFiles { get; } = [];
     public List<FakeUpdate> Updates { get; } = [];
     public DeployOutcome DeployOutcome { get; set; } = new DeployOutcome.Succeeds();
 }
@@ -636,8 +644,8 @@ public sealed class FakeKomodo : IAsyncDisposable
                     update_available = v.UpdateAvailable,
                 }).ToArray(),
                 auto_update_all_services = false,
-                project_missing = false,
-                missing_files = Array.Empty<string>(),
+                project_missing = s.ProjectMissing,
+                missing_files = s.MissingFiles.ToArray(),
                 deployed_hash = (string?)null,
                 latest_hash = (string?)null,
             },
@@ -654,8 +662,8 @@ public sealed class FakeKomodo : IAsyncDisposable
         ["description"] = "",
         ["template"] = s.Template,
         ["tags"] = Array.Empty<string>(),
-        ["info"] = new { missing_files = Array.Empty<string>() },
-        ["config"] = new { server_id = s.ServerId, swarm_id = s.SwarmId },
+        ["info"] = new { missing_files = s.MissingFiles.ToArray() },
+        ["config"] = new { server_id = s.ServerId, swarm_id = s.SwarmId, ignore_services = s.IgnoreServices.ToArray() },
         ["base_permission"] = "None",
     };
 
@@ -702,11 +710,13 @@ public sealed class FakeKomodo : IAsyncDisposable
         var lines = Lines(s.LogText);
         var stdout = string.Join("\n", lines.Skip(Math.Max(0, lines.Length - tail)));
         var command = $"docker compose -p {s.Name} logs --tail {tail} {string.Join(" ", services)}".TrimEnd();
-        return new Answer(200, LogJson(new FakeLog("get stack log", stdout, Command: command), Now()));
+        return new Answer(200, LogJson(new FakeLog("get stack log", stdout, s.LogStderr, Command: command), Now()));
     }
 
     // client/core/rs/src/api/read/stack.rs SearchStackLog; bin/periphery/src/helpers.rs: the last 5000 lines through
-    // grep -E 'a|b' (Or) or grep -P '^(?=.*a)(?=.*b)' (And), terms as regular expressions, case-sensitive.
+    // grep -E 'a|b' (Or) or grep -P '^(?=.*a)(?=.*b)' (And), terms as regular expressions, case-sensitive. grep exits 1
+    // when no line matches, and Komodo's Log is then success false with empty streams (bin/periphery/src/api/compose.rs
+    // GetComposeLogSearch, lib/command/src/lib.rs output_into_log).
     private Answer SearchStackLog(FakeStack s, JsonElement p)
     {
         var terms = p.GetProperty("terms").EnumerateArray().Select(x => new Regex(x.GetString()!)).ToArray();
@@ -714,8 +724,9 @@ public sealed class FakeKomodo : IAsyncDisposable
         var invert = p.TryGetProperty("invert", out var i) && i.GetBoolean();
         var lines = Lines(s.LogText);
         var matching = lines.Skip(Math.Max(0, lines.Length - 5000))
-            .Where(line => (and ? terms.All(r => r.IsMatch(line)) : terms.Any(r => r.IsMatch(line))) != invert);
-        return new Answer(200, LogJson(new FakeLog("search stack log", string.Join("\n", matching), Command: "grep"), Now()));
+            .Where(line => (and ? terms.All(r => r.IsMatch(line)) : terms.Any(r => r.IsMatch(line))) != invert)
+            .ToList();
+        return new Answer(200, LogJson(new FakeLog("Search Stack Log", string.Join("\n", matching), Success: matching.Count > 0, Command: "grep"), Now()));
     }
 
     private static string[] Lines(string text) => text.Length == 0 ? [] : text.Split('\n');

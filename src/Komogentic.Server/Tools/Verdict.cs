@@ -14,12 +14,20 @@ public enum Colour
 /// <summary>
 /// Green, yellow or red in one word, with why (spec §4, Decision 4). Komodo's <c>StackState</c> is snake_case,
 /// <c>StackServiceState</c> PascalCase (client/core/rs/src/entities/stack.rs), and a container's health shows only in
-/// its Docker status ("Up 5 minutes (healthy)"). "Update available" never changes the colour.
+/// its Docker status ("Up 5 minutes (healthy)"). "Update available" never changes the colour. The stack's
+/// <c>ignore_services</c> don't count, as in Komodo's own state; missing compose files, or a compose project missing
+/// on the host while the stack should be up, are red whatever the services say.
 /// </summary>
 public static class Verdict
 {
-    public static (Colour Colour, string Why) OfStack(StackListItem stack, IReadOnlyList<StackService>? services)
+    public static (Colour Colour, string Why) OfStack(StackListItem stack, IReadOnlyList<StackService>? services, IReadOnlyCollection<string>? ignored = null)
     {
+        // entities/stack.rs StackListItemInfo: "if there are paths here, this is an unhealthy state, and deploying will fail".
+        if (stack.Info.MissingFiles.Count > 0) return (Colour.Red, "compose files missing: " + string.Join(", ", stack.Info.MissingFiles));
+        // Komodo sets project_missing only off down and unknown; its UI ignores it while deploying, as a first deploy has none yet.
+        if (stack.Info.ProjectMissing && stack.Info.State is not ("down" or "deploying"))
+            return (Colour.Red, "its compose project is missing on the server (not in docker compose ls)");
+
         switch (stack.Info.State)
         {
             case "deploying":
@@ -40,7 +48,7 @@ public static class Verdict
         }
 
         if (services is null) return (Colour.Yellow, "its services' health could not be read");
-        var counted = services.Where(s => !IsCompleted(s)).Select(s => (s.Service, Verdict: OfService(s))).ToList();
+        var counted = services.Where(s => !IsCompleted(s) && !IsIgnored(s, ignored)).Select(s => (s.Service, Verdict: OfService(s))).ToList();
         if (counted.Count == 0) return (Colour.Red, "no service is running");
         var worst = counted.Max(c => c.Verdict.Colour);
         return worst == Colour.Green
@@ -69,6 +77,9 @@ public static class Verdict
             _ => (Colour.Red, "state unknown"),
         };
     }
+
+    /// <summary>One of the stack's <c>config.ignore_services</c>: Komodo leaves it out of the stack's state, and so does the verdict.</summary>
+    public static bool IsIgnored(StackService service, IReadOnlyCollection<string>? ignored) => ignored?.Contains(service.Service) == true;
 
     /// <summary>A container that ran and exited with code 0: a migration or another one-shot job, done.</summary>
     public static bool IsCompleted(StackService service) =>

@@ -14,8 +14,9 @@ public sealed class VerdictTests
     private static StackService SwarmService(string state, string name = "web") =>
         new("stack-id", "app", name, "nginx:1", null, new SwarmServiceListItem("id", $"app_{name}", "nginx:1"), state);
 
-    private static StackListItem Stack(string state, bool updateAvailable = false) =>
-        new("stack-id", "app", new StackListItemInfo("server-1", "server-1", "", "", state, null, [new StackServiceWithUpdate("web", "nginx:1", null, updateAvailable)]));
+    private static StackListItem Stack(string state, bool updateAvailable = false, bool projectMissing = false, string[]? missingFiles = null) =>
+        new("stack-id", "app", new StackListItemInfo("server-1", "server-1", "", "", state, null,
+            [new StackServiceWithUpdate("web", "nginx:1", null, updateAvailable)], projectMissing, missingFiles ?? []));
 
     [Fact]
     public void Running_and_healthy_is_green()
@@ -126,5 +127,39 @@ public sealed class VerdictTests
         Assert.Equal(Colour.Red, Verdict.OfStack(Stack("running"), []).Colour);
         // Only completed one-shot services: nothing runs.
         Assert.Equal(Colour.Red, Verdict.OfStack(Stack("running"), [Service("Exited", "Exited (0) 1 minute ago")]).Colour);
+    }
+
+    [Fact]
+    public void Ignored_services_do_not_count()
+    {
+        var init = Service("Exited", "Exited (1) 3 minutes ago", "init");
+        var starting = Service("Running", "Up 3 seconds (health: starting)", "sidecar");
+
+        Assert.Equal(Colour.Red, Verdict.OfStack(Stack("running"), [Service("Running"), init]).Colour);
+        Assert.Equal((Colour.Green, "every service is running"), Verdict.OfStack(Stack("running"), [Service("Running"), init, starting], ["init", "sidecar"]));
+        Assert.Equal(Colour.Yellow, Verdict.OfStack(Stack("running"), [Service("Running"), init, starting], ["init"]).Colour);
+    }
+
+    [Fact]
+    public void Missing_project_is_red_unless_down_or_deploying()
+    {
+        var (colour, why) = Verdict.OfStack(Stack("running", projectMissing: true), [Service("Running")]);
+        Assert.Equal(Colour.Red, colour);
+        Assert.Contains("compose project", why, StringComparison.Ordinal);
+        Assert.Equal(Colour.Red, Verdict.OfStack(Stack("unhealthy", projectMissing: true), [Service("Running")]).Colour);
+        Assert.Equal(Colour.Red, Verdict.OfStack(Stack("down", projectMissing: true), null).Colour);
+        Assert.Equal("down: not deployed", Verdict.OfStack(Stack("down", projectMissing: true), null).Why);
+        // As in Komodo's own UI: a first deploy has no project yet.
+        Assert.Equal(Colour.Yellow, Verdict.OfStack(Stack("deploying", projectMissing: true), null).Colour);
+    }
+
+    [Fact]
+    public void Missing_files_are_red()
+    {
+        var (colour, why) = Verdict.OfStack(Stack("running", missingFiles: ["compose.yaml", "compose.prod.yaml"]), [Service("Running")]);
+
+        Assert.Equal(Colour.Red, colour);
+        Assert.Equal("compose files missing: compose.yaml, compose.prod.yaml", why);
+        Assert.Equal(Colour.Red, Verdict.OfStack(Stack("deploying", missingFiles: ["compose.yaml"]), null).Colour);
     }
 }

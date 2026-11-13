@@ -100,13 +100,23 @@ public sealed partial class KomodoClient(HttpClient http)
     public async Task<StackRef> GetStackAsync(KomodoAuth auth, string idOrName, CancellationToken ct)
     {
         var answer = await SendAsync(KomodoCall.GetStack, auth, new { stack = idOrName }, ct);
-        return Parse(KomodoCall.GetStack.Name, answer, a => new StackRef(
-            a.GetProperty("_id").GetProperty("$oid").GetString() ?? throw new JsonException(),
-            a.GetProperty("name").GetString() ?? throw new JsonException(),
-            // StackConfig.swarm_id: a String with a default, so always there; an older Core without it is in Server mode.
-            a.TryGetProperty("config", out var config) && config.TryGetProperty("swarm_id", out var swarm) && swarm.ValueKind == JsonValueKind.String
-                ? swarm.GetString()!
-                : ""));
+        return Parse(KomodoCall.GetStack.Name, answer, a =>
+        {
+            var hasConfig = a.TryGetProperty("config", out var config) && config.ValueKind == JsonValueKind.Object;
+            return new StackRef(
+                a.GetProperty("_id").GetProperty("$oid").GetString() ?? throw new JsonException(),
+                a.GetProperty("name").GetString() ?? throw new JsonException(),
+                // StackConfig.swarm_id: a String with a default, so always there; an older Core without it is in Server mode.
+                hasConfig && config.TryGetProperty("swarm_id", out var swarm) && swarm.ValueKind == JsonValueKind.String
+                    ? swarm.GetString()!
+                    : "")
+            {
+                // StackConfig.ignore_services: a Vec<String> with a default, serialised as an array.
+                IgnoreServices = hasConfig && config.TryGetProperty("ignore_services", out var ignored) && ignored.ValueKind == JsonValueKind.Array
+                    ? [.. ignored.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString()!)]
+                    : [],
+            };
+        });
     }
 
     public async Task<IReadOnlyList<StackService>> ListStackServicesAsync(KomodoAuth auth, string stack, CancellationToken ct)

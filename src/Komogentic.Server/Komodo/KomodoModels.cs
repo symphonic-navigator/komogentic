@@ -22,14 +22,25 @@ public sealed record CreatedKey(string Key, string Secret)
     public override string ToString() => $"CreatedKey {{ Key = {Key} }}";
 }
 
-/// <summary>A stack's id (<c>_id.$oid</c>), canonical name and Swarm (<c>config.swarm_id</c>, empty in Server mode), from
-/// <c>entities/stack.rs</c> <c>Stack</c> (a <c>Resource</c>, <c>entities/mod.rs</c>).</summary>
-public sealed record StackRef(string Id, string Name, string SwarmId = "");
+/// <summary>A stack's id (<c>_id.$oid</c>), canonical name, Swarm (<c>config.swarm_id</c>, empty in Server mode) and the
+/// services Komodo leaves out of its state (<c>config.ignore_services</c>), from <c>entities/stack.rs</c> <c>Stack</c>
+/// (a <c>Resource</c>, <c>entities/mod.rs</c>).</summary>
+public sealed record StackRef(string Id, string Name, string SwarmId = "")
+{
+    public IReadOnlyList<string> IgnoreServices { get; init; } = [];
+
+    public bool Equals(StackRef? other) =>
+        other is not null && Id == other.Id && Name == other.Name && SwarmId == other.SwarmId && IgnoreServices.SequenceEqual(other.IgnoreServices);
+
+    public override int GetHashCode() => HashCode.Combine(Id, Name, SwarmId, IgnoreServices.Count);
+}
 
 /// <summary><c>entities/stack.rs</c> <c>StackListItem</c> = <c>ResourceListItem&lt;StackListItemInfo&gt;</c> (<c>entities/resource.rs</c>).</summary>
 public sealed record StackListItem(string Id, string Name, StackListItemInfo Info);
 
-/// <summary><c>entities/stack.rs</c> <c>StackListItemInfo</c>; <c>State</c> is a snake_case <c>StackState</c>.</summary>
+/// <summary><c>entities/stack.rs</c> <c>StackListItemInfo</c>; <c>State</c> is a snake_case <c>StackState</c>.
+/// <c>ProjectMissing</c>: the compose project is not on the host (Komodo sets it only when the stack is neither down nor
+/// unknown); <c>MissingFiles</c>: compose files missing in the repository, so a deploy will fail.</summary>
 public sealed record StackListItemInfo(
     string ServerId,
     string ServerName,
@@ -37,7 +48,9 @@ public sealed record StackListItemInfo(
     string SwarmName,
     string State,
     string? Status,
-    IReadOnlyList<StackServiceWithUpdate> Services);
+    IReadOnlyList<StackServiceWithUpdate> Services,
+    bool ProjectMissing,
+    IReadOnlyList<string> MissingFiles);
 
 /// <summary><c>entities/stack.rs</c> <c>StackServiceWithUpdate</c>.</summary>
 public sealed record StackServiceWithUpdate(string Service, string Image, string? LatestImage, bool UpdateAvailable);

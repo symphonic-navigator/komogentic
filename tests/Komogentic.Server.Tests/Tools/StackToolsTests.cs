@@ -5,8 +5,10 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Komogentic.Server.Auth;
 using Komogentic.Server.Komodo;
 using Komogentic.Server.Tests.Api;
+using Komogentic.Server.Tools;
 using Komogentic.Server.Tests.Komodo;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -83,6 +85,7 @@ public sealed class StackToolsTests : IAsyncLifetime
         _app.Komodo.ClearFailures();
         _app.Komodo.Delay("DeployStack", TimeSpan.Zero);
         _app.Komodo.Delay("GetUpdate", TimeSpan.Zero);
+        _app.Komodo.Delay("ListStacks", TimeSpan.Zero);
     }
 
     private static string NewId() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(12));
@@ -100,8 +103,9 @@ public sealed class StackToolsTests : IAsyncLifetime
     /// <summary>A stack Anna may not see.</summary>
     private FakeStack AddBilling() => _app.Komodo.AddStack(NewId(), Billing, services: [new FakeService("web", "billing:1")]);
 
-    private async Task<McpClient> ConnectAsync()
+    private async Task<McpClient> ConnectAsync(WebApplicationFactory<Program>? api = null)
     {
+        api ??= _api;
         var transport = new HttpClientTransport(
             new HttpClientTransportOptions
             {
@@ -112,19 +116,34 @@ public sealed class StackToolsTests : IAsyncLifetime
                     ["X-Forwarded-For"] = Dashboard.NewAddress(),
                 },
             },
-            _api.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false, BaseAddress = new Uri(AppFactory.PublicUrl) }),
+            api.CreateClient(new WebApplicationFactoryClientOptions { HandleCookies = false, BaseAddress = new Uri(AppFactory.PublicUrl) }),
             NullLoggerFactory.Instance,
             ownsHttpClient: true);
         return await McpClient.CreateAsync(transport, cancellationToken: Ct);
     }
 
-    private async Task<CallToolResult> CallAsync(string tool, object? arguments = null)
+    private async Task<CallToolResult> CallAsync(string tool, object? arguments = null, WebApplicationFactory<Program>? api = null, CancellationToken? ct = null)
     {
-        await using var client = await ConnectAsync();
+        await using var client = await ConnectAsync(api);
         var args = arguments is null
             ? new Dictionary<string, object?>()
             : JsonSerializer.SerializeToElement(arguments).EnumerateObject().ToDictionary(p => p.Name, p => (object?)p.Value);
-        return await client.CallToolAsync(tool, args, cancellationToken: Ct);
+        return await client.CallToolAsync(tool, args, cancellationToken: ct ?? Ct);
+    }
+
+    private List<string> AuditLines() => _log.Lines.Where(l => l.Contains(" Komogentic.Audit: ", StringComparison.Ordinal)).ToList();
+
+    /// <summary>Waits (a few real seconds at most) for an audit line that contains all of <paramref name="parts"/>.</summary>
+    private async Task<string> AuditLineAsync(params string[] parts)
+    {
+        var watch = Stopwatch.StartNew();
+        while (true)
+        {
+            if (AuditLines().FirstOrDefault(l => parts.All(p => l.Contains(p, StringComparison.Ordinal))) is { } line) return line;
+            if (watch.Elapsed > TimeSpan.FromSeconds(10))
+                throw new Xunit.Sdk.XunitException($"No audit line with {string.Join(", ", parts)}; there are:\n{string.Join("\n", AuditLines())}");
+            await Task.Delay(20, Ct);
+        }
     }
 
     private static string Text(CallToolResult result) => string.Join("\n", result.Content.OfType<TextContentBlock>().Select(b => b.Text));
@@ -590,5 +609,185 @@ public sealed class StackToolsTests : IAsyncLifetime
             Assert.False(line.Contains(komodoKey.Secret, StringComparison.Ordinal), "A log line holds the Komodo secret.");
             Assert.False(line.Contains("secret-search-term", StringComparison.Ordinal), "A log line holds the search terms.");
         }
+    }
+
+    [Fact]
+    public async Task Search_without_matches_is_not_an_error()
+    {
+        var stack = AddApp(FakePermission.Read | FakePermission.Logs);
+        stack.LogText = "ok line\nanother ok line";
+
+        // grep exits 1 when nothing matches: Komodo's log then says success false, with empty streams.
+        Assert.Equal("(no line matches)", await OkAsync("get_stack_logs", new { stack = App, search = new[] { "exception" } }));
+        Assert.Equal("(no line matches)", await OkAsync("get_stack_logs", new { stack = App, search = new[] { "ok", "exception" }, match_all = true }));
+    }
+
+    [Fact]
+    public async Task Large_stderr_does_not_push_stdout_out()
+    {
+        var stack = AddApp(FakePermission.Read | FakePermission.Logs);
+        stack.LogText = string.Join("\n", Enumerable.Range(1, 10).Select(i => $"out line {i}"));
+        stack.LogStderr = string.Join("\n", Enumerable.Range(1, 3000).Select(i => $"{i:D6} complaint " + new string('e', 90)));
+
+        var text = await OkAsync("get_stack_logs", new { stack = App });
+
+        Assert.Contains("out line 1\n", text, StringComparison.Ordinal);
+        Assert.Contains("out line 10\n", text, StringComparison.Ordinal);
+        Assert.Contains("--- stderr ---", text, StringComparison.Ordinal);
+        Assert.Contains("003000 complaint", text, StringComparison.Ordinal);
+        Assert.True(text.IndexOf("out line 10", StringComparison.Ordinal) < text.IndexOf("--- stderr ---", StringComparison.Ordinal), "stdout comes first");
+        Assert.InRange(text.Length, 1, 230_000);
+    }
+
+    [Fact]
+    public async Task Swarm_search_is_explained()
+    {
+        var stack = AddApp(FakePermission.Read | FakePermission.Logs);
+        stack.SwarmId = "swarm-1";
+        var before = Requests("SearchStackLog").Count;
+
+        var text = await ErrorAsync("get_stack_logs", new { stack = App, services = new[] { "web" }, search = new[] { "exception" } });
+
+        Assert.Contains("Komodo 2.3.4 can't search the logs of a Swarm service", text, StringComparison.Ordinal);
+        Assert.Contains("get_stack_logs without search", text, StringComparison.Ordinal);
+        Assert.Equal(before, Requests("SearchStackLog").Count);
+        await using var client = await ConnectAsync();
+        var logs = (await client.ListToolsAsync(cancellationToken: Ct)).Single(t => t.Name == "get_stack_logs");
+        Assert.Contains("can't search a Swarm stack's logs", logs.Description, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Poll_errors_keep_the_update_id()
+    {
+        var stack = AddApp(FakePermission.Execute);
+        stack.DeployOutcome = new DeployOutcome.Succeeds(AfterPolls: 1);
+        _app.Komodo.FailNext("GetUpdate", 500, FakeKomodo.ErrorBody("Failed to query the database"));
+
+        Assert.StartsWith("deploy succeeded in ", await OkAsync("deploy_stack", new { stack = App }), StringComparison.Ordinal);
+
+        _app.Komodo.Fail("GetUpdate", 500, FakeKomodo.ErrorBody("Failed to query the database"));
+        var text = await OkAsync("restart_stack", new { stack = App, wait_seconds = 5 });
+
+        Assert.Equal($"still running (or unknown) after 5 s; update id {stack.Updates.Last().Id} — follow it with list_stack_updates", text);
+    }
+
+    [Fact]
+    public void Polls_every_two_seconds_then_every_five()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(2), StackTools.PollDelay(TimeSpan.Zero));
+        Assert.Equal(TimeSpan.FromSeconds(2), StackTools.PollDelay(TimeSpan.FromSeconds(29.9)));
+        Assert.Equal(TimeSpan.FromSeconds(5), StackTools.PollDelay(TimeSpan.FromSeconds(30)));
+        Assert.Equal(TimeSpan.FromSeconds(5), StackTools.PollDelay(TimeSpan.FromMinutes(9)));
+    }
+
+    [Fact]
+    public async Task Execute_refused_by_komodo_says_execute()
+    {
+        AddApp(FakePermission.Execute);
+        _app.Komodo.FailNext("DeployStack", 500,
+            FakeKomodo.ErrorBody("User does not have required permissions on this Stack. Must have at least Execute permissions"));
+        _app.Komodo.FailNext("RestartStack", 500,
+            FakeKomodo.ErrorBody("User does not have required permissions on this Stack. Must have at least Execute permissions"));
+
+        Assert.Equal($"your Komodo user lacks Execute on stack {App}", await ErrorAsync("deploy_stack", new { stack = App }));
+        Assert.Equal($"your Komodo user lacks Execute on stack {App}", await ErrorAsync("restart_stack", new { stack = App }));
+    }
+
+    [Fact]
+    public async Task Updates_list_survives_a_failing_get_update()
+    {
+        var app = AddApp();
+        _app.Komodo.AddUpdate(app.Id, _userId, "DeployStack", true, 1_000, 2_000);
+        _app.Komodo.AddUpdate(app.Id, _userId, "RestartStack", true, 3_000, 4_000);
+        _app.Komodo.FailNext("GetUpdate", 500, FakeKomodo.ErrorBody("Failed to query the database"));
+
+        var text = await OkAsync("list_stack_updates", new { stack = App });
+
+        Assert.Single(text.Split('\n'), l => l.Contains(" — end unknown — succeeded", StringComparison.Ordinal));
+        Assert.Single(text.Split('\n'), l => l.Contains(" — ended ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Ignored_services_are_shown_and_not_counted()
+    {
+        var stack = AddApp(services:
+        [
+            new FakeService("web", "nginx:1"),
+            new FakeService("init", "app:latest", State: "Exited", ContainerState: "exited", Status: "Exited (1) 3 minutes ago"),
+        ]);
+        stack.IgnoreServices.Add("init");
+
+        var status = await OkAsync("get_stack_status", new { stack = App });
+        var list = await OkAsync("list_stacks");
+
+        Assert.StartsWith($"{App} — server-1 — running — green", status, StringComparison.Ordinal);
+        Assert.Contains("- init: Exited", status, StringComparison.Ordinal);
+        Assert.Contains("ignored", status.Split('\n').Single(l => l.StartsWith("- init:", StringComparison.Ordinal)), StringComparison.Ordinal);
+        Assert.Contains($"{App} — server-1 — running — green", list, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Missing_project_or_files_are_red()
+    {
+        var stack = AddApp();
+        stack.ProjectMissing = true;
+
+        Assert.Contains($"{App} — server-1 — running — red", await OkAsync("list_stacks"), StringComparison.Ordinal);
+        Assert.Contains("compose project", await OkAsync("get_stack_status", new { stack = App }), StringComparison.Ordinal);
+
+        stack.ProjectMissing = false;
+        stack.MissingFiles.Add("compose.yaml");
+        Assert.Contains("red: compose files missing: compose.yaml", await OkAsync("get_stack_status", new { stack = App }), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Audit_names_the_canonical_stack_and_filters_the_agents_text()
+    {
+        var stack = AddApp();
+
+        await OkAsync("get_stack_status", new { stack = stack.Id });
+        await ErrorAsync("get_stack_status", new { stack = "nope\u2028\u2029\u202E\u200B\u0007" + new string('y', 200) });
+
+        Assert.Contains(AuditLines(), l => l.Contains($"Tool get_stack_status on {App} by {_username}", StringComparison.Ordinal));
+        Assert.Contains(AuditLines(), l => l.Contains($"Tool get_stack_status on nope{new string('y', 96)} by {_username}", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Cancelled_call_is_audited()
+    {
+        AddApp();
+        // Two real seconds: the agent gives up long before.
+        _app.Komodo.Delay("ListStacks", TimeSpan.FromSeconds(2));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        await using var client = await ConnectAsync();
+        cts.CancelAfter(TimeSpan.FromMilliseconds(300));
+
+        // The SDK's client surfaces it as cancelled or as the aborted request (499), depending on timing.
+        await Assert.ThrowsAnyAsync<Exception>(() => client.CallToolAsync("list_stacks", new Dictionary<string, object?>(), cancellationToken: cts.Token).AsTask());
+
+        await AuditLineAsync($"Tool list_stacks on - by {_username}", ": cancelled");
+    }
+
+    [Fact]
+    public async Task Unexpected_exception_is_audited()
+    {
+        AddApp();
+        await using var broken = _api.WithWebHostBuilder(b => b.ConfigureTestServices(s =>
+        {
+            s.RemoveAll<ICredentialHealth>();
+            s.AddSingleton<ICredentialHealth, BrokenHealth>();
+        }));
+        _app.Komodo.DeleteKey(_app.Komodo.ApiKeys.Single(k => k.UserId == _userId && !k.Deleted).Key);
+
+        var result = await CallAsync("list_stacks", api: broken);
+
+        Assert.True(result.IsError);
+        await AuditLineAsync($"Tool list_stacks on - by {_username}", ": error");
+    }
+
+    private sealed class BrokenHealth : ICredentialHealth
+    {
+        public Task KomodoKeyRejectedAsync(RequestCaller caller, string komodoKey, CancellationToken ct) =>
+            throw new InvalidOperationException("The credential store is broken.");
     }
 }

@@ -8,10 +8,12 @@ using Komogentic.Server.Accounts;
 using Komogentic.Server.Auth;
 using Komogentic.Server.Komodo;
 using Komogentic.Server.Tests.Api;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace Komogentic.Server.Tests.Tools;
 
@@ -70,6 +72,30 @@ public sealed class McpApiKeyTests(AppFactory app)
         Assert.Equal(["get_stack_logs", "get_stack_status", "list_stack_updates", "list_stacks"], names);
         Assert.True(call["result"]?["isError"]?.GetValue<bool>());
         Assert.Equal("this connection was granted read-only access", call["result"]!["content"]![0]!["text"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Read_only_refusal_is_audited()
+    {
+        var key = await KeyAsync(app.PublicApi);
+        var resolved = (await app.PublicApi.Services.GetRequiredService<ApiKeys>().ResolveAsync(key, Ct)).Key
+            ?? throw new InvalidOperationException("The key does not resolve.");
+        var readOnly = ReadOnlyCaller(resolved);
+        var log = new CapturedLog();
+        using var api = app.PublicApi.WithWebHostBuilder(b => b
+            .ConfigureLogging(l => l.AddProvider(log))
+            .ConfigureTestServices(s =>
+            {
+                s.RemoveAll<RequestCaller>();
+                s.AddScoped(_ => readOnly);
+            }));
+
+        await RawAsync(api, key,
+            """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"restart_stack","arguments":{"stack":"app\u2028x"}}}""", []);
+
+        Assert.Single(log.Lines, l => l.Contains(
+            $" Komogentic.Audit: Tool restart_stack on appx by {resolved.User.Username} via connection Grok assistant (connection-id), client Grok: refused: read-only",
+            StringComparison.Ordinal));
     }
 
     /// <summary>A caller as a read-only grant would be, built past the middleware's private constructor.</summary>
