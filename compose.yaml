@@ -4,7 +4,7 @@
 
 services:
   mongo:
-    image: ${KOMOGENTIC_MONGO_IMAGE:-mongo:8}
+    image: ${KOMOGENTIC_MONGO_IMAGE:-mongo:9}
     restart: unless-stopped
     # A single-node replica set: Komogentic's token rotation and consent write several documents in one transaction.
     command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
