@@ -2,7 +2,7 @@
 # Base images by digest, so a re-tagged image can't change what is built; the tag before the digest says which
 # image it is and is what Dependabot follows (.github/dependabot.yml) when it proposes a new digest.
 # node:26-slim
-FROM node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 AS web
+FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS web
 WORKDIR /src
 COPY web/package.json web/pnpm-lock.yaml web/
 # Node 25+ ships no corepack, so pnpm comes from npm, at the version web/package.json's packageManager names.
